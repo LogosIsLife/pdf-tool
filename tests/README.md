@@ -38,7 +38,8 @@ A form passes when it prints no `PROBLEM` line. What each line means:
 ## Tool functions and edge cases
 
 Runs `list_form_fields` and `fill_form` against stand-ins for the Open WebUI
-modules. Storage, download links and search indexing on a real server are not
+modules, including name matching, the read-back of written values, the
+`status` contract and the page images in the result. Storage, download links and search indexing on a real server are not
 covered.
 
 ```

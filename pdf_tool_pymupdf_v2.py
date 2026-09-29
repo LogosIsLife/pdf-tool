@@ -1,7 +1,7 @@
 """
 title: PDF Form Filler (PyMuPDF)
 author: darlene
-version: 1.1.0
+version: 1.2.0
 license: AGPL-3.0
 description: Inspect and fill the form fields (AcroForm) of a PDF attached to the chat, return the filled PDF as a downloadable attachment, and show a page to the model as an image.
 """
@@ -477,11 +477,19 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
             name = w.field_name
             if not name:
                 continue
-            info: dict[str, Any] = {"page": page.number + 1, "kind": _kind(w), "value": w.field_value}
+            info: dict[str, Any] = {
+                "page": page.number + 1,
+                "kind": _kind(w),
+                "value": w.field_value,
+                "xref": w.xref,
+            }
             try:
                 info.update(_widget_label(words, body_h, w.rect))
             except Exception:
                 pass
+            tip = _inherited(doc, w.xref, "TU")
+            if tip[0] == "string" and _clean_label(tip[1]):
+                info["tooltip"] = _clean_label(tip[1])
             if info["kind"] == "checkbox_or_radio":
                 info["on_value"] = _on_state(w)
                 info["radio"] = w.field_type == _mu().PDF_WIDGET_TYPE_RADIOBUTTON
@@ -541,6 +549,9 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
                     labels.append(_label(b))
             if labels:
                 entry["label"] = labels[0]
+            tip = group[0].get("tooltip")
+            if tip and tip != name and tip not in labels:
+                entry["tooltip"] = tip
             if len(group) > 1 and len(labels) > 1:
                 entry["shared_by_boxes"] = labels
                 entry["warning"] = (
@@ -556,11 +567,37 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
         "pages": pages,
         "field_count": len(out),
         "fields": out,
-        "note": "Use 'label' (the text printed on the form next to or under the box) to decide what each field is for; fill by 'name'.",
+        "note": (
+            "Use 'label' (the text printed on the form next to or under the box) and 'tooltip' (the form's own "
+            "description of the box) to decide what each field is for; fill by 'name', copied exactly."
+        ),
     }
 
 
 # ---- page images -------------------------------------------------------------
+
+
+def _show_stored_drawings(doc) -> None:
+    """Make the page image show the drawings that are in the file.
+
+    When a form asks viewers to redraw its boxes (NeedAppearances), MuPDF
+    draws every value again at the form's declared font size, and a value
+    that was fitted into its box comes out cut off. The file's own drawings
+    are used when every value has one. Changes the open copy only.
+    """
+    try:
+        form = _form_location(doc, create=False)
+        if form is None or _get(doc, form[0], form[1] + "NeedAppearances")[1] != "true":
+            return
+        mu = _mu()
+        drawn = (mu.PDF_WIDGET_TYPE_TEXT, mu.PDF_WIDGET_TYPE_COMBOBOX, mu.PDF_WIDGET_TYPE_LISTBOX)
+        for page in doc:
+            for w in page.widgets():
+                if w.field_type in drawn and w.field_value not in (None, "", []) and not _has_drawn_text(doc, w.xref):
+                    return
+        doc.xref_set_key(form[0], form[1] + "NeedAppearances", "false")
+    except Exception:
+        pass
 
 
 def render_pdf_page(
@@ -586,6 +623,7 @@ def render_pdf_page(
             raise ValueError(f"page must be a whole number between 1 and {count}.")
         if number < 1 or number > count:
             raise ValueError(f"This PDF has {count} page(s); page {number} does not exist.")
+        _show_stored_drawings(doc)
         pg = doc[number - 1]
         dpi = max(40, min(int(dpi or 110), 300))
         longest = max(pg.rect.width, pg.rect.height) / 72.0  # inches
@@ -624,6 +662,68 @@ def render_pdf_page(
 
 _TRUE_WORDS = {"true", "yes", "y", "on", "x", "1", "checked", "check", "selected"}
 _FALSE_WORDS = {"false", "no", "n", "off", "0", "unchecked", "uncheck", "none", ""}
+
+
+def _key_norm(text: Any) -> str:
+    """'Street Address of registered agent:' -> 'streetaddressofregisteredagent'."""
+    return re.sub(r"[^a-z0-9]+", "", _decode_name(str(text)).lower())
+
+
+def _resolve_names(boxes: dict[str, list[dict[str, Any]]], values: dict[str, Any]):
+    """Match the names the model sent to the names the form uses.
+
+    A name is accepted when it is exact, or when exactly one field fits it:
+    by a name that differs only in letter case, spacing or punctuation, or by
+    its printed label or tooltip. A name that fits several fields is not
+    guessed at ("City" is one field's name and the tooltip of four others).
+    Returns (mapped, remapped, unknown, ambiguous): mapped is
+    {form name: value}, remapped is {name sent: form name}.
+    """
+    by_name: dict[str, list[str]] = {}
+    by_label: dict[str, list[str]] = {}
+    for name, group in boxes.items():
+        by_name.setdefault(_key_norm(name), []).append(name)
+        seen = set()
+        for b in group:
+            for key in ("tooltip", "label_left", "label_below", "label_right"):
+                norm = _key_norm(b.get(key) or "")
+                # Shorter than this is a stray word beside the box ("OR", "TX").
+                if len(norm) >= 4 and norm not in seen:
+                    seen.add(norm)
+                    by_label.setdefault(norm, []).append(name)
+
+    mapped: dict[str, Any] = {}
+    remapped: dict[str, str] = {}
+    unknown: list[str] = []
+    ambiguous: list[dict[str, Any]] = []
+    loose = []
+    for k, v in values.items():
+        if k in boxes:
+            mapped[k] = v
+        else:
+            loose.append((k, v))
+    for k, v in loose:
+        norm = _key_norm(k)
+        found = list(by_name.get(norm, [])) if norm else []
+        found += [n for n in by_label.get(norm, []) if n not in found] if norm else []
+        if not found:
+            unknown.append(k)
+        elif len(found) > 1:
+            ambiguous.append(
+                {
+                    "sent": k,
+                    "reason": "fits several fields; use one exact name",
+                    "candidates": [{"name": n, "page": boxes[n][0]["page"]} for n in found],
+                }
+            )
+        elif found[0] in mapped:
+            ambiguous.append(
+                {"sent": k, "reason": "another name in the same call already filled this field", "candidates": [{"name": found[0], "page": boxes[found[0]][0]["page"]}]}
+            )
+        else:
+            mapped[found[0]] = v
+            remapped[k] = found[0]
+    return mapped, remapped, unknown, ambiguous
 
 
 def _normalize_values(boxes: dict[str, list[dict[str, Any]]], clean: dict[str, str]) -> list[dict[str, Any]]:
@@ -709,7 +809,11 @@ def _fitted_size(widget, value: str) -> Optional[float]:
             return False
         per_line = max(1.0, (width - 4) / (size * 0.5))
         if not multiline:
-            return longest <= per_line
+            try:
+                # Helvetica is as wide as any font a form is likely to use.
+                return max(mu.get_text_length(line, "helv", size) for line in lines) <= width - 4
+            except Exception:
+                return longest <= per_line
         needed = sum(max(1, math.ceil(len(line) / per_line)) for line in lines)
         if needed == 1:
             return True  # one line: only the height limit above applies
@@ -843,12 +947,25 @@ def _fix_button_values(doc, touched: set[str]) -> int:
     return fixed
 
 
+def _has_drawn_text(doc, xref: int) -> bool:
+    """Whether a box's drawing contains any text."""
+    kind, value = _get(doc, xref, "AP/N")
+    body = b""
+    if kind == "xref" and _refs(value):
+        try:
+            body = doc.xref_stream(_refs(value)[0]) or b""
+        except Exception:
+            body = b""
+    return b"Tj" in body or b"TJ" in body
+
+
 def _refresh_empty_appearances(doc) -> int:
     """Draw values that the form stores but never drew.
 
     Some forms keep a value in a field and leave its drawing empty, trusting
-    the viewer to fill it in. A flattened copy keeps only drawings, so such a
-    value would vanish. Returns the number of boxes redrawn.
+    the viewer to fill it in. A page image and a flattened copy show only
+    drawings, so such a value would be missing. Returns the number of boxes
+    redrawn.
     """
     mu = _mu()
     redrawn = 0
@@ -859,11 +976,7 @@ def _refresh_empty_appearances(doc) -> int:
                     continue
                 if w.field_value in (None, "", []):
                     continue
-                kind, value = _get(doc, w.xref, "AP/N")
-                body = b""
-                if kind == "xref" and _refs(value):
-                    body = doc.xref_stream(_refs(value)[0]) or b""
-                if b"Tj" in body or b"TJ" in body:
+                if _has_drawn_text(doc, w.xref):
                     continue
                 _draw_value(doc, w, w.field_value)
                 redrawn += 1
@@ -897,31 +1010,90 @@ def _drop_stacked_duplicates(doc) -> int:
     return removed
 
 
+def _read_back(data: bytes, wanted: dict[str, str]) -> list[dict[str, Any]]:
+    """Open the written file again and list every value that is not there.
+
+    A text value counts only when it is stored and drawn: a page image shows
+    drawings, not stored values.
+    """
+
+    def text(v) -> str:
+        if isinstance(v, (list, tuple)):
+            v = ", ".join(str(x) for x in v)
+        return str("" if v is None else v).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def state(v) -> str:
+        return "/" + _decode_name(str(v or "Off")).lstrip("/")
+
+    doc = _prepared(data)
+    try:
+        after = _collect(doc)
+        missing: list[dict[str, Any]] = []
+        for name, want in wanted.items():
+            group = after.get(name) or []
+            if not group:
+                missing.append({"field": name, "wanted": want, "got": None, "reason": "field not found after writing"})
+                continue
+            kind = group[0]["kind"]
+            if kind == "checkbox_or_radio":
+                got = next(
+                    (b["on_value"] for b in group if b.get("on_value") and state(b["value"]) == b["on_value"]),
+                    "/Off",
+                )
+                if state(got) != state(want):
+                    missing.append({"field": name, "wanted": want, "got": got, "page": group[0]["page"]})
+                continue
+            got = text(group[0]["value"])
+            accepted = {text(want)}
+            if kind == "choice":
+                accepted |= {text(stored) for stored, shown in group[0].get("choices") or [] if text(shown) == text(want)}
+            if got not in accepted:
+                missing.append({"field": name, "wanted": want, "got": got, "page": group[0]["page"]})
+            elif text(want):
+                blank = [b["page"] for b in group if not _has_drawn_text(doc, b["xref"])]
+                if blank:
+                    missing.append(
+                        {
+                            "field": name,
+                            "wanted": want,
+                            "got": got,
+                            "page": blank[0],
+                            "reason": "value stored but not drawn on the page",
+                        }
+                    )
+        return missing
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 def fill_pdf_fields(
     path: str,
     values: dict[str, Any],
     flatten: bool = False,
     rejected: Optional[list] = None,
+    report: Optional[dict] = None,
 ) -> tuple[bytes, list[str]]:
     """Fill fields and return (pdf_bytes, unknown_field_names).
 
     Pass a list as `rejected` to receive values that matched none of a field's
-    options; those fields are left as they were.
+    options; those fields are left as they were. Pass a dict as `report` to
+    receive what was written and whether it reads back: filled, remapped,
+    ambiguous, did_not_stick, pages_touched.
     """
     mu = _mu()
     doc = _prepared(path)
     try:
         boxes = _collect(doc)
-        known = set(boxes)
-        if not known:
+        if not boxes:
             raise ValueError(
                 "This PDF has no fillable fields (a flat, scanned, or already flattened form), so there is nothing to fill."
             )
-        unknown = [k for k in values if k not in known]
+        mapped, remapped, unknown, ambiguous = _resolve_names(boxes, values)
         clean: dict[str, str] = {}
-        for k, v in values.items():
-            if k not in known:
-                continue
+        for k, v in mapped.items():
             if isinstance(v, bool):
                 clean[k] = "true" if v else "false"
             else:
@@ -945,15 +1117,38 @@ def fill_pdf_fields(
                     _draw_value(doc, w, value)
 
         _fix_button_values(doc, set(clean))
+        _refresh_empty_appearances(doc)
         if flatten:
-            _refresh_empty_appearances(doc)
+            # Flattening removes the fields, so the check reads the copy made just before.
+            check = doc.tobytes(garbage=0)
             _drop_stacked_duplicates(doc)
             doc.bake(annots=False, widgets=True)
+            data = doc.tobytes(garbage=3, deflate=True)
         else:
             form = _form_location(doc, create=False)
             if form is not None:
                 doc.xref_set_key(form[0], form[1] + "NeedAppearances", "true")
-        return doc.tobytes(garbage=3, deflate=True), unknown
+            data = check = doc.tobytes(garbage=3, deflate=True)
+
+        if report is not None:
+            try:
+                did_not_stick = _read_back(check, clean)
+            except Exception as e:
+                did_not_stick = [
+                    {"field": k, "wanted": v, "got": None, "reason": f"could not be read back ({type(e).__name__})"}
+                    for k, v in clean.items()
+                ]
+            failed = {d["field"] for d in did_not_stick}
+            report.update(
+                {
+                    "filled": [k for k in clean if k not in failed],
+                    "remapped": remapped,
+                    "ambiguous": ambiguous,
+                    "did_not_stick": did_not_stick,
+                    "pages_touched": sorted({b["page"] for k in clean for b in boxes[k]}),
+                }
+            )
+        return data, unknown
     finally:
         try:
             doc.close()
@@ -987,6 +1182,14 @@ class Tools:
         render_max_kb: int = Field(
             default=3000,
             description="Largest page image, in kilobytes, sent to the model. Larger pages are sent as JPEG or at lower resolution.",
+        )
+
+        review_pages: int = Field(
+            default=3,
+            description=(
+                "How many filled pages fill_form shows the model for checking (0 to 4). Only pages that were "
+                "written to are shown. Needs Open WebUI 0.11.4 or later; older versions ask the model to call render_page."
+            ),
         )
 
     def __init__(self):
@@ -1034,6 +1237,21 @@ class Tools:
             "Several PDFs are attached; pass file_id. Attached: "
             + ", ".join(f"{p['name']} (id {p['id']})" for p in pdfs)
         )
+
+    @staticmethod
+    def _host_shows_images_in_results() -> bool:
+        """Whether Open WebUI hands images inside a JSON result to the model.
+
+        From 0.11.4 a result may be a dict and every value that is a
+        data:image string reaches the model as a picture. Before that the
+        whole result had to be one image, and a dict would arrive as text.
+        """
+        try:
+            from open_webui.utils import middleware
+
+            return callable(getattr(middleware, "extract_base64_images", None))
+        except Exception:
+            return False
 
     # ---- tools exposed to the model -------------------------------------
 
@@ -1139,15 +1357,23 @@ class Tools:
         __files__: Optional[list] = None,
         __event_emitter__=None,
         __request__=None,
-    ) -> str:
+    ):
         """
         Fill the form fields of an attached PDF and return the filled PDF as a
-        chat attachment. Field names must match list_form_fields exactly.
+        chat attachment. Use the exact field names from list_form_fields.
+        The form is complete only when status is "ok". When status is
+        "partial", some values were NOT written: read the lists at the top of
+        the result, call list_form_fields, and call fill_form again with the
+        returned file_id and only the missing fields. Do not ask the user
+        about a field this tool already flagged. Before telling the user the
+        form is complete, look at every page in pages_touched: either in
+        page_images of this result, or with render_page. If a value is missing
+        on the image, call fill_form again.
         :param values: JSON object mapping field names to values, e.g. {"Name": "Jane Doe", "Date": "09/16/2026"}. Include every field you want filled in ONE call. For a checkbox use true or false; for a radio group use the option value from list_form_fields (for example "/A").
         :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
         :param output_name: File name for the filled copy. Defaults to "<original>-filled.pdf".
         :param flatten: Leave unset. Only set true when the user explicitly asks for a flattened or non-editable PDF.
-        :return: A summary including the full download URL of the filled PDF. When the user asks for a link, give them download_link_markdown verbatim. To check the result, call render_page with the returned file_id.
+        :return: A summary: status, what was not written and why, the pages to check, and the full download URL of the filled PDF. When the user asks for a link, give them download_link_markdown verbatim.
         """
         from open_webui.models.files import FileForm, Files
         from open_webui.storage.provider import Storage
@@ -1164,7 +1390,35 @@ class Tools:
             fid, path, orig_name = await self._pick_file(file_id, __files__, user_id)
             do_flatten = _as_bool(flatten, default=self.valves.flatten_by_default)
             rejected: list = []
-            pdf_bytes, unknown = fill_pdf_fields(path, parsed, flatten=do_flatten, rejected=rejected)
+            report: dict = {}
+            pdf_bytes, unknown = fill_pdf_fields(path, parsed, flatten=do_flatten, rejected=rejected, report=report)
+            ambiguous = report.get("ambiguous") or []
+            did_not_stick = report.get("did_not_stick") or []
+            filled = report.get("filled") or []
+
+            problems: dict[str, Any] = {}
+            if unknown:
+                problems["ignored_unknown_fields"] = unknown
+            if ambiguous:
+                problems["ambiguous_fields"] = ambiguous
+            if rejected:
+                problems["not_set_invalid_option"] = rejected
+            if did_not_stick:
+                problems["did_not_stick"] = did_not_stick
+
+            if not filled:
+                # Nothing was written: an unchanged copy in the chat would pass for a filled form.
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        **problems,
+                        "next": (
+                            "Nothing was filled and no file was made. Call list_form_fields, then fill_form "
+                            "again with the exact names. Do not ask the user."
+                        ),
+                    },
+                    indent=2,
+                )
 
             base = os.path.splitext(os.path.basename(orig_name))[0]
             out_name = output_name.strip() or f"{base}-filled.pdf"
@@ -1239,27 +1493,62 @@ class Tools:
                     }
                 )
 
-            not_set = {r["field"] for r in rejected}
-            filled = [k for k in parsed if k not in unknown and k not in not_set]
-            result = {
-                "status": "ok",
-                "file_id": new_id,
-                "file_name": out_name,
-                "download_url": full_url,
-                "download_link_markdown": f"[{out_name}]({full_url})",
-                "filled_fields": filled,
-                "flattened": do_flatten,
-                "indexed_for_search": indexed,
-            }
-            if rejected:
-                result["not_set_invalid_option"] = rejected
-                result["option_hint"] = (
-                    "These checkbox/radio fields were left unchanged because the value matched none of their "
-                    "options. Call fill_form again for them using one of valid_options."
+            pages = report.get("pages_touched") or []
+            limit = max(0, min(int(self.valves.review_pages or 0), 4))
+            images: dict[str, str] = {}
+            if limit and self._host_shows_images_in_results():
+                for number in pages[:limit]:
+                    try:
+                        data, mime, _ = render_pdf_page(
+                            pdf_bytes,
+                            page=number,
+                            dpi=self.valves.render_dpi,
+                            max_kb=self.valves.render_max_kb,
+                        )
+                        images[f"page_{number}"] = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+                    except Exception:
+                        continue
+            unseen = [n for n in pages if f"page_{n}" not in images]
+
+            steps = []
+            if problems:
+                steps.append(
+                    "Some values were NOT written. Call list_form_fields, then fill_form again with "
+                    f'file_id "{new_id}", the exact names, and only the fields listed above. Do not ask the user.'
                 )
-            if unknown:
-                result["ignored_unknown_fields"] = unknown
-                result["hint"] = "Unknown names were skipped. Use list_form_fields for exact names."
+            if images:
+                steps.append(
+                    "Look at page_images and compare every value with what was asked. "
+                    "If one is missing or cut off, call fill_form again."
+                )
+            if unseen:
+                steps.append(
+                    f'Call render_page with file_id "{new_id}" for page(s) {", ".join(str(n) for n in unseen)} '
+                    "and check the values before telling the user the form is complete."
+                )
+
+            result: dict[str, Any] = {"status": "partial" if problems else "ok"}
+            result.update(problems)
+            result["next"] = " ".join(steps)
+            result.update(
+                {
+                    "file_id": new_id,
+                    "file_name": out_name,
+                    "download_url": full_url,
+                    "download_link_markdown": f"[{out_name}]({full_url})",
+                    "filled_fields": filled,
+                    "pages_touched": pages,
+                    "flattened": do_flatten,
+                    "indexed_for_search": indexed,
+                }
+            )
+            if report.get("remapped"):
+                result["remapped_fields"] = report["remapped"]
+            if images:
+                # Returned as a dict: Open WebUI takes the pictures out for the
+                # model and turns the rest into JSON text.
+                result["page_images"] = images
+                return result
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"error": str(e)})

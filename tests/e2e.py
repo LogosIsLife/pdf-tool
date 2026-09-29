@@ -47,11 +47,12 @@ listing = json.loads(run(T.list_form_fields(__user__=USER, __files__=[f1])))
 ok('list_form_fields returns fields', listing.get('field_count') == 23, f"field_count={listing.get('field_count')}")
 vals = {'Text4': 'Dr. Jane Doe', 'Text5': 'Sepsis Update', 'Text6': '10/15/2026', 'Check Box1': '/Yes', 'Check Box7': '/Yes', 'Nope': 'x'}
 out = json.loads(run(T.fill_form(json.dumps(vals), __user__=USER, __files__=[f1], __event_emitter__=emit)))
-ok('fill_form status ok', out.get('status') == 'ok', str({k: out.get(k) for k in ('status', 'error', 'file_name', 'flattened')}))
+ok('fill with an unknown name is partial, not ok', out.get('status') == 'partial' and out.get('file_id'), str({k: out.get(k) for k in ('status', 'error', 'file_name', 'flattened')}))
+ok('problems come before the file details', list(out)[:3] == ['status', 'ignored_unknown_fields', 'next'], str(list(out)[:4]))
 ok('unknown field reported', out.get('ignored_unknown_fields') == ['Nope'], str(out.get('ignored_unknown_fields')))
 ok('full download url built', str(out.get('download_url', '')).startswith('https://example.test/api/v1/files/'), str(out.get('download_url')))
 ok('file event emitted', bool(events) and events[-1]['type'] == 'files')
-if out.get('status') == 'ok':
+if out.get('file_id'):
     rec = STORE[out['file_id']]; r = PdfReader(rec.path); f = r.get_fields()
     ok('stored file has values', f['Text4'].get('/V') == 'Dr. Jane Doe' and str(f['Check Box1'].get('/V')) == '/Yes', f"{f['Text4'].get('/V')!r} {f['Check Box1'].get('/V')!r}")
     ok('untouched field stays empty', f['Check Box2'].get('/V') in (None, '/Off') and not f['Text4'].get('/V') is None, repr(f['Check Box2'].get('/V')))
@@ -139,4 +140,70 @@ if hasattr(tool, 'inspect_pdf_fields'):
     print('   listing Text1       :', json.dumps(L.get('Text1'))[:330])
     L = {e['name']: e for e in tool.inspect_pdf_fields(f'{PROJ}/00-985-filled copy.pdf')['fields']}
     print('   listing AOrB (copy) :', json.dumps(L.get('AOrB'))[:260])
+# 9 names that differ in case or punctuation, labels, and the result contract
+src = f'{PROJ}/205_boc_test.pdf'
+f5 = attach('205_boc_test.pdf', 'f-205b')
+sent = {'Street Address of registered agent:': '1 Main St', 'Zip Code of registered agent': '78701', 'City of registered agent:': 'Austin'}
+rep_ = {}; pdf, unk = tool.fill_pdf_fields(src, sent, report=rep_); f = PdfReader(io.BytesIO(pdf)).get_fields()
+ok('names differing in case or punctuation are matched', not unk and f['Street address of registered agent:'].get('/V') == '1 Main St' and f['Zip code of registered agent:'].get('/V') == '78701', f"unknown={unk} remapped={rep_.get('remapped')}")
+ok('remapped names are reported', rep_.get('remapped') == {'Street Address of registered agent:': 'Street address of registered agent:', 'Zip Code of registered agent': 'Zip code of registered agent:'}, str(rep_.get('remapped')))
+ok('pages written to are reported', rep_.get('pages_touched') == [1] and not rep_.get('did_not_stick'), f"{rep_.get('pages_touched')} {rep_.get('did_not_stick')}")
+rep_ = {}; pdf, unk = tool.fill_pdf_fields(src, {'Mailing Address': '9 Elm St', 'City': 'Waco'}, report=rep_); f = PdfReader(io.BytesIO(pdf)).get_fields()
+ok('a tooltip that fits one field is matched', f['Initial Mailing Address'].get('/V') == '9 Elm St' and rep_['pages_touched'] == [2], f"{f['Initial Mailing Address'].get('/V')!r} {rep_.get('remapped')}")
+amb = rep_.get('ambiguous') or [{}]
+ok('a name that fits several fields is not guessed', amb[0].get('sent') == 'City' and len(amb[0].get('candidates', [])) > 1 and not f['City:'].get('/V'), str(amb)[:160])
+o = run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])); o = json.loads(o) if isinstance(o, str) else o
+ok('fill_form is ok when every name resolves', o.get('status') == 'ok' and o.get('pages_touched') == [1] and 'render_page' in o.get('next', ''), str({k: o.get(k) for k in ('status', 'pages_touched', 'next')})[:200])
+before = len(STORE)
+o = json.loads(run(T.fill_form(json.dumps({'Nope': 'x'}), __user__=USER, __files__=[f5])))
+ok('nothing filled -> failed, and no file made', o.get('status') == 'failed' and 'file_id' not in o and len(STORE) == before, str(o)[:160])
+o = json.loads(run(T.fill_form(json.dumps({'Text4': 'Z', 'Check Box1': 'maybe'}), __user__=USER, __files__=[f1])))
+ok('an invalid option makes the fill partial', o.get('status') == 'partial' and list(o)[1] == 'not_set_invalid_option', str(list(o)[:3]))
+
+# 10 a value that is stored but not drawn is caught, and drawn on the next fill
+import pymupdf
+d = pymupdf.open(src)
+for pg in d:
+    for w in pg.widgets():
+        if w.field_name == 'Initial Mailing Address':
+            d.xref_set_key(w.xref, 'V', '(9 Elm St)')
+d.save(f'{OUT}/undrawn.pdf'); d.close()
+miss = tool._read_back(open(f'{OUT}/undrawn.pdf', 'rb').read(), {'Initial Mailing Address': '9 Elm St'})
+ok('stored but undrawn value is reported', len(miss) == 1 and 'not drawn' in miss[0].get('reason', ''), str(miss))
+miss = tool._read_back(open(src, 'rb').read(), {'City:': 'Waco', 'registered': '/is an organization'})
+ok('values that are absent are reported', [m['field'] for m in miss] == ['City:', 'registered'], str(miss)[:200])
+rep_ = {}; pdf, _ = tool.fill_pdf_fields(f'{OUT}/undrawn.pdf', {'City of Initial Mailing Address': 'Waco'}, report=rep_)
+ok('every fill draws values the form stored but never drew', not tool._read_back(pdf, {'Initial Mailing Address': '9 Elm St', 'City of Initial Mailing Address': 'Waco'}))
+long = '1234 Long Example Street, Suite 500'
+pdf, _ = tool.fill_pdf_fields(src, {'Initial Mailing Address': long}); d = pymupdf.open(stream=pdf, filetype='pdf')
+w = next(w for w in d[1].widgets() if w.field_name == 'Initial Mailing Address')
+d2 = pymupdf.open(stream=tool.fill_pdf_fields(src, {'Initial Mailing Address': long}, flatten=True)[0], filetype='pdf')
+ok('a long value is drawn whole inside its box', long in d2[1].get_text('text', clip=w.rect + (-2, -2, 2, 2)), repr(d2[1].get_text('text', clip=w.rect + (-2, -2, 2, 2))))
+open(f'{OUT}/long.pdf', 'wb').write(pdf)
+import base64
+def dark(data, rect, dpi):
+    """Rightmost column with ink inside rect, in points from the left edge of the box."""
+    pm = pymupdf.Pixmap(data); k = dpi / 72; cols = []
+    for x in range(int(rect.x0 * k), int(rect.x1 * k)):
+        if any(sum(pm.pixel(x, y)[:3]) < 300 for y in range(int(rect.y0 * k) + 2, int(rect.y1 * k) - 2)): cols.append(x)
+    return (max(cols) / k - rect.x0) if cols else 0
+data, mime, det = tool.render_pdf_page(f'{OUT}/long.pdf', page=2)
+end = dark(data, w.rect, det['dpi']); need = pymupdf.get_text_length(long, 'tiro', 8.5)
+ok('the page image shows the long value whole, as the file draws it', need - 6 <= end <= w.rect.width - 2, f'ink ends at {end:.0f} pt, text is {need:.0f} pt, box is {w.rect.width:.0f} pt')
+
+# 11 page images in the result, where Open WebUI takes them (0.11.4 on)
+ok('no page images on an older Open WebUI', isinstance(run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])), str))
+sys.modules['open_webui.utils'] = types.ModuleType('open_webui.utils')
+mw = types.ModuleType('open_webui.utils.middleware'); mw.extract_base64_images = lambda value, files: value
+sys.modules['open_webui.utils.middleware'] = mw; sys.modules['open_webui.utils'].middleware = mw
+both = dict(sent, **{'Initial Mailing Address': '9 Elm St', 'Date:': '09/28/2026'})
+o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
+ok('touched pages come back as images', isinstance(o, dict) and sorted(o.get('page_images', {})) == ['page_1', 'page_2', 'page_3'] and all(v.startswith('data:image/') and ' ' not in v for v in o['page_images'].values()), str(o.get('pages_touched') if isinstance(o, dict) else o[:80]))
+T.valves.review_pages = 1
+o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
+ok('pages over the limit are left to render_page', list(o.get('page_images', {})) == ['page_1'] and 'page(s) 2, 3' in o.get('next', ''), o.get('next', '')[-150:])
+T.valves.review_pages = 0
+ok('review_pages=0 sends no images', isinstance(run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5])), str))
+T.valves.review_pages = 3
+
 n = sum(1 for r in results if r[1]); print(f'\n{TOOL}: {n}/{len(results)} passed'); [print('   FAILED:', r[0], '|', r[2]) for r in results if not r[1]]

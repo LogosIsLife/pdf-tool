@@ -12,7 +12,7 @@ The whole tool is one file: `pdf_tool_pymupdf_v2.py`.
 | Function | Purpose |
 |---|---|
 | `list_form_fields` | List every fillable field: name, type, the label printed next to the box, current value, and valid options. |
-| `fill_form` | Fill fields from a JSON object of `{field name: value}` and attach the filled PDF to the chat. Optionally flatten it. |
+| `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model the pages it wrote to. Optionally flatten it. |
 | `render_page` | Hand one page to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
 
 Flat and scanned PDFs have no fields to fill. The tool reports that instead of
@@ -36,6 +36,7 @@ drawing text over the page.
 | `base_url` | empty | Public URL of the Open WebUI, used to build full download links. When empty, the WebUI URL from **Admin > Settings > General** is used, then the request host. |
 | `render_dpi` | `110` | Resolution of page images sent to the model (40 to 300). |
 | `render_max_kb` | `3000` | Largest page image sent to the model, in kilobytes. Larger pages are sent as JPEG or at lower resolution. |
+| `review_pages` | `3` | How many filled pages `fill_form` shows the model for checking (0 to 4). Only pages that were written to are shown. Needs Open WebUI 0.11.4 or later. |
 
 ## Usage
 
@@ -49,7 +50,8 @@ makes three calls:
    {"Name": "Jane Doe", "Date": "09/16/2026", "Agree": true, "Plan": "/A"}
    ```
 
-3. `render_page` with the `file_id` that `fill_form` returned, to check the result.
+3. `render_page` with the `file_id` that `fill_form` returned, for any page
+   in `pages_touched` that `fill_form` did not already show.
 
 When several PDFs are attached, pass `file_id` to choose one.
 
@@ -58,7 +60,32 @@ Values are matched loosely. A checkbox accepts `true`/`false`, `yes`/`no`,
 group takes one of its option values. A dropdown takes the shown text or the
 stored value, in any letter case. A value that matches no option is left
 unset and reported in `not_set_invalid_option` along with the valid options.
-Unknown field names are skipped and reported in `ignored_unknown_fields`.
+
+Field names are matched exactly first. A name that differs only in letter
+case, spacing or punctuation, or that is the printed label or tooltip of a
+field, is accepted when exactly one field fits it, and reported in
+`remapped_fields`. A name that fits several fields is not guessed at.
+
+## What `fill_form` returns
+
+`status` is `ok` only when every name resolved and every value reads back
+from the written file. Otherwise it is `partial`, or `failed` when nothing
+was written (no file is made). The reasons come first in the result:
+
+| Key | Meaning |
+|---|---|
+| `ignored_unknown_fields` | Names that fit no field. |
+| `ambiguous_fields` | Names that fit several fields, with the candidates and their pages. |
+| `not_set_invalid_option` | Values that match none of a field's options, with the valid options. |
+| `did_not_stick` | Values that are missing from the written file, or stored but not drawn on the page. |
+| `next` | What the model has to do before it may call the form complete. |
+
+`pages_touched` lists the pages that were written to. On Open WebUI 0.11.4
+or later those pages, up to `review_pages`, reach the model as images in the
+same result. On older versions, and for pages over the limit, `next` tells
+the model to call `render_page`. Images reach the model only through a
+tool's return value; `__event_emitter__` shows files to the user, not to the
+model.
 
 ## What it handles
 
@@ -71,8 +98,13 @@ Unknown field names are skipped and reported in `ignored_unknown_fields`.
   selected box. The form's own check mark drawings are kept.
 - **Text that does not fit its box** is drawn at a smaller font size for that
   value only. The form's font setting is left as it was.
-- **Flattening** draws values the form stored but never drew, and removes
-  boxes stacked on top of each other so text is not printed twice.
+- **Values stored but never drawn** are drawn on every fill, so they show in
+  page images and in viewers that do not draw them on their own.
+- **Page images** show the drawings that are in the file. MuPDF would
+  otherwise redraw every value at the form's declared font size and cut off
+  a value that was fitted into its box.
+- **Flattening** removes boxes stacked on top of each other so text is not
+  printed twice.
 - **Password-protected and damaged files** return a message the user can act on.
 - **File ownership**: a file that belongs to another user is refused.
 
