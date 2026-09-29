@@ -672,10 +672,10 @@ def _key_norm(text: Any) -> str:
 def _resolve_names(boxes: dict[str, list[dict[str, Any]]], values: dict[str, Any]):
     """Match the names the model sent to the names the form uses.
 
-    A name is accepted when it is exact, or when exactly one field fits it:
-    by a name that differs only in letter case, spacing or punctuation, or by
-    its printed label or tooltip. A name that fits several fields is not
-    guessed at ("City" is one field's name and the tooltip of four others).
+    A name is accepted when it is exact, when it differs from one field's
+    name only in letter case, spacing or punctuation, or, failing that, when
+    it is the printed label or tooltip of exactly one field. A name that fits
+    several fields is not guessed at.
     Returns (mapped, remapped, unknown, ambiguous): mapped is
     {form name: value}, remapped is {name sent: form name}.
     """
@@ -704,8 +704,9 @@ def _resolve_names(boxes: dict[str, list[dict[str, Any]]], values: dict[str, Any
             loose.append((k, v))
     for k, v in loose:
         norm = _key_norm(k)
-        found = list(by_name.get(norm, [])) if norm else []
-        found += [n for n in by_label.get(norm, []) if n not in found] if norm else []
+        # A name that is off by a space or a capital was copied from the
+        # listing; it outranks a label, which several fields may share.
+        found = (by_name.get(norm) or by_label.get(norm) or []) if norm else []
         if not found:
             unknown.append(k)
         elif len(found) > 1:
@@ -1010,11 +1011,12 @@ def _drop_stacked_duplicates(doc) -> int:
     return removed
 
 
-def _read_back(data: bytes, wanted: dict[str, str]) -> list[dict[str, Any]]:
+def _read_back(data: bytes, wanted: dict[str, str], empty: Optional[dict] = None) -> list[dict[str, Any]]:
     """Open the written file again and list every value that is not there.
 
     A text value counts only when it is stored and drawn: a page image shows
-    drawings, not stored values.
+    drawings, not stored values. Pass a dict as `empty` to receive the text
+    and choice fields that hold no value, as {"page 2": [names]}.
     """
 
     def text(v) -> str:
@@ -1028,6 +1030,10 @@ def _read_back(data: bytes, wanted: dict[str, str]) -> list[dict[str, Any]]:
     doc = _prepared(data)
     try:
         after = _collect(doc)
+        if empty is not None:
+            for name, group in after.items():
+                if group[0]["kind"] in ("text", "choice") and not text(group[0]["value"]):
+                    empty.setdefault(f"page {group[0]['page']}", []).append(name)
         missing: list[dict[str, Any]] = []
         for name, want in wanted.items():
             group = after.get(name) or []
@@ -1081,7 +1087,7 @@ def fill_pdf_fields(
     Pass a list as `rejected` to receive values that matched none of a field's
     options; those fields are left as they were. Pass a dict as `report` to
     receive what was written and whether it reads back: filled, remapped,
-    ambiguous, did_not_stick, pages_touched.
+    blank, ambiguous, did_not_stick, still_empty, pages_touched.
     """
     mu = _mu()
     doc = _prepared(path)
@@ -1131,8 +1137,9 @@ def fill_pdf_fields(
             data = check = doc.tobytes(garbage=3, deflate=True)
 
         if report is not None:
+            empty: dict[str, list[str]] = {}
             try:
-                did_not_stick = _read_back(check, clean)
+                did_not_stick = _read_back(check, clean, empty)
             except Exception as e:
                 did_not_stick = [
                     {"field": k, "wanted": v, "got": None, "reason": f"could not be read back ({type(e).__name__})"}
@@ -1142,9 +1149,13 @@ def fill_pdf_fields(
             report.update(
                 {
                     "filled": [k for k in clean if k not in failed],
+                    "blank": [
+                        k for k, v in clean.items() if not v.strip() and boxes[k][0]["kind"] in ("text", "choice")
+                    ],
                     "remapped": remapped,
                     "ambiguous": ambiguous,
                     "did_not_stick": did_not_stick,
+                    "still_empty": empty,
                     "pages_touched": sorted({b["page"] for k in clean for b in boxes[k]}),
                 }
             )
@@ -1365,7 +1376,8 @@ class Tools:
         "partial", some values were NOT written: read the lists at the top of
         the result, call list_form_fields, and call fill_form again with the
         returned file_id and only the missing fields. Do not ask the user
-        about a field this tool already flagged. Before telling the user the
+        about a field this tool already flagged. still_empty lists the fields
+        that hold no value: fill the ones the request covers. Before telling the user the
         form is complete, look at every page in pages_touched: either in
         page_images of this result, or with render_page. If a value is missing
         on the image, call fill_form again.
@@ -1521,6 +1533,12 @@ class Tools:
                     "Look at page_images and compare every value with what was asked. "
                     "If one is missing or cut off, call fill_form again."
                 )
+            still_empty = report.get("still_empty") or {}
+            if still_empty:
+                steps.append(
+                    "The fields in still_empty hold no value. If the request covers one of them, call fill_form "
+                    f'again with file_id "{new_id}" and only those fields; leave the rest empty. Do not ask the user.'
+                )
             if unseen:
                 steps.append(
                     f'Call render_page with file_id "{new_id}" for page(s) {", ".join(str(n) for n in unseen)} '
@@ -1544,6 +1562,11 @@ class Tools:
             )
             if report.get("remapped"):
                 result["remapped_fields"] = report["remapped"]
+            if still_empty:
+                result["still_empty"] = still_empty
+            if report.get("blank"):
+                # An empty value counts as filled; say so, or the box looks like a failed write.
+                result["left_blank_as_sent"] = report["blank"]
             if images:
                 # Returned as a dict: Open WebUI takes the pictures out for the
                 # model and turns the rest into JSON text.

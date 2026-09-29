@@ -148,10 +148,12 @@ rep_ = {}; pdf, unk = tool.fill_pdf_fields(src, sent, report=rep_); f = PdfReade
 ok('names differing in case or punctuation are matched', not unk and f['Street address of registered agent:'].get('/V') == '1 Main St' and f['Zip code of registered agent:'].get('/V') == '78701', f"unknown={unk} remapped={rep_.get('remapped')}")
 ok('remapped names are reported', rep_.get('remapped') == {'Street Address of registered agent:': 'Street address of registered agent:', 'Zip Code of registered agent': 'Zip code of registered agent:'}, str(rep_.get('remapped')))
 ok('pages written to are reported', rep_.get('pages_touched') == [1] and not rep_.get('did_not_stick'), f"{rep_.get('pages_touched')} {rep_.get('did_not_stick')}")
-rep_ = {}; pdf, unk = tool.fill_pdf_fields(src, {'Mailing Address': '9 Elm St', 'City': 'Waco'}, report=rep_); f = PdfReader(io.BytesIO(pdf)).get_fields()
-ok('a tooltip that fits one field is matched', f['Initial Mailing Address'].get('/V') == '9 Elm St' and rep_['pages_touched'] == [2], f"{f['Initial Mailing Address'].get('/V')!r} {rep_.get('remapped')}")
-amb = rep_.get('ambiguous') or [{}]
-ok('a name that fits several fields is not guessed', amb[0].get('sent') == 'City' and len(amb[0].get('candidates', [])) > 1 and not f['City:'].get('/V'), str(amb)[:160])
+rep_ = {}; pdf, unk = tool.fill_pdf_fields(src, {'Mailing Address': '9 Elm St', 'Middle Initial of Governing Person:': 'A'}, report=rep_); f = PdfReader(io.BytesIO(pdf)).get_fields()
+ok('a tooltip that fits one field is matched', f['Initial Mailing Address'].get('/V') == '9 Elm St' and rep_['pages_touched'] == [1, 2], f"{f['Initial Mailing Address'].get('/V')!r} {rep_.get('remapped')}")
+ok('a name off by one space wins over a tooltip three fields share', f['Middle Initial  of Governing Person:'].get('/V') == 'A' and not rep_.get('ambiguous'), str(rep_.get('ambiguous'))[:160])
+box = lambda page, tip: [{'page': page, 'kind': 'text', 'value': '', 'tooltip': tip}]
+m, r, u, amb = tool._resolve_names({'a1': box(1, 'Home City'), 'a2': box(2, 'Home City'), 'a3': box(2, 'Zip')}, {'home city': 'Waco', 'ZIP': '1', 'zzz': '2'})
+ok('a name that fits several fields is not guessed', not m and u == ['ZIP', 'zzz'] and amb[0].get('sent') == 'home city' and [c['name'] for c in amb[0]['candidates']] == ['a1', 'a2'], f'{m} {u} {amb}'[:200])
 o = run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])); o = json.loads(o) if isinstance(o, str) else o
 ok('fill_form is ok when every name resolves', o.get('status') == 'ok' and o.get('pages_touched') == [1] and 'render_page' in o.get('next', ''), str({k: o.get(k) for k in ('status', 'pages_touched', 'next')})[:200])
 before = len(STORE)
@@ -159,6 +161,12 @@ o = json.loads(run(T.fill_form(json.dumps({'Nope': 'x'}), __user__=USER, __files
 ok('nothing filled -> failed, and no file made', o.get('status') == 'failed' and 'file_id' not in o and len(STORE) == before, str(o)[:160])
 o = json.loads(run(T.fill_form(json.dumps({'Text4': 'Z', 'Check Box1': 'maybe'}), __user__=USER, __files__=[f1])))
 ok('an invalid option makes the fill partial', o.get('status') == 'partial' and list(o)[1] == 'not_set_invalid_option', str(list(o)[:3]))
+o = json.loads(run(T.fill_form(json.dumps({'Initial Mailing Address': '', 'City of Initial Mailing Address': 'Austin'}), __user__=USER, __files__=[f5])))
+ok('a value sent empty is named, not passed off as filled text', o.get('status') == 'ok' and o.get('left_blank_as_sent') == ['Initial Mailing Address'], str(o.get('left_blank_as_sent')))
+first = {'City of Initial Mailing Address': 'Austin', 'State of Initial Mailing Address': 'TX', 'Zip Code of Initial Mailing Address': '78711'}
+o = json.loads(run(T.fill_form(json.dumps(first), __user__=USER, __files__=[f5])))
+ok('a field the model left out is listed as still empty', 'Initial Mailing Address' in o.get('still_empty', {}).get('page 2', []) and 'City of Initial Mailing Address' not in str(o.get('still_empty')) and 'still_empty' in o.get('next', ''), str(o.get('still_empty', {}).get('page 2'))[:120])
+ok('push buttons and checkboxes are not listed as empty', not {'Print Form', 'registered', 'document'} & {n for v in o.get('still_empty', {}).values() for n in v})
 
 # 10 a value that is stored but not drawn is caught, and drawn on the next fill
 import pymupdf

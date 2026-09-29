@@ -61,9 +61,9 @@ group takes one of its option values. A dropdown takes the shown text or the
 stored value, in any letter case. A value that matches no option is left
 unset and reported in `not_set_invalid_option` along with the valid options.
 
-Field names are matched exactly first. A name that differs only in letter
-case, spacing or punctuation, or that is the printed label or tooltip of a
-field, is accepted when exactly one field fits it, and reported in
+Field names are matched exactly first, then by a name that differs only in
+letter case, spacing or punctuation, then by the printed label or tooltip
+when exactly one field has it. Such matches are reported in
 `remapped_fields`. A name that fits several fields is not guessed at.
 
 ## What `fill_form` returns
@@ -79,6 +79,13 @@ was written (no file is made). The reasons come first in the result:
 | `not_set_invalid_option` | Values that match none of a field's options, with the valid options. |
 | `did_not_stick` | Values that are missing from the written file, or stored but not drawn on the page. |
 | `next` | What the model has to do before it may call the form complete. |
+
+`still_empty` lists, page by page, the text and choice fields that hold no
+value after the fill, so a field the model left out of its call shows up in
+the result instead of on the page image only.
+
+`left_blank_as_sent` names the fields whose value was sent empty, so a box
+the model left blank is not taken for a write that failed.
 
 `pages_touched` lists the pages that were written to. On Open WebUI 0.11.4
 or later those pages, up to `review_pages`, reach the model as images in the
