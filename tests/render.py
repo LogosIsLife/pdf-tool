@@ -1,6 +1,9 @@
 """Tests for render_page: the page image handed to the model.
 
-Usage: python tests/render.py <project folder> <output folder> <tool file> [extra folder of PDFs]
+Usage: python tests/render.py <project folder> <output folder> [tool file] [extra folder of PDFs]
+
+The tool file is pdf_tool.py in the project folder unless given; an absolute
+path works too. The sample PDFs are read from the project folder.
 """
 
 import sys, io, os, re, json, glob, types, asyncio, base64, importlib.util, logging, warnings
@@ -11,7 +14,8 @@ import numpy as np
 from PIL import Image
 from pypdf import PdfReader
 
-PROJ, OUT, TOOL = sys.argv[1], sys.argv[2], sys.argv[3]
+PROJ, OUT = sys.argv[1], sys.argv[2]
+TOOL = sys.argv[3] if len(sys.argv) > 3 else "pdf_tool.py"
 EXTRA = sys.argv[4] if len(sys.argv) > 4 else None
 os.makedirs(OUT, exist_ok=True)
 
@@ -72,7 +76,7 @@ for name, attrs in {
     m.__dict__.update(attrs)
     sys.modules[name] = m
 
-spec = importlib.util.spec_from_file_location("tool", f"{PROJ}/{TOOL}")
+spec = importlib.util.spec_from_file_location("tool", os.path.join(PROJ, TOOL))
 tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 T = tool.Tools()

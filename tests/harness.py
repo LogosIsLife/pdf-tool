@@ -1,4 +1,10 @@
-"""Fill every field of every form with pdf_tool_v2 and verify the result."""
+"""Fill every field of every form with the tool and verify the result.
+
+Usage: python tests/harness.py <project folder> <output folder> [tool file] [folder of PDFs]
+
+The tool file is pdf_tool.py in the project folder unless given; an absolute
+path works too. The PDFs come from the project folder unless a folder is given.
+"""
 
 import sys, io, os, json, glob, subprocess, importlib.util, re
 from pypdf import PdfReader, PdfWriter
@@ -8,10 +14,11 @@ import numpy as np
 from PIL import Image
 
 PROJ, OUT = sys.argv[1], sys.argv[2]
-TOOL = sys.argv[3] if len(sys.argv) > 3 else "pdf_tool_v4.py"
-spec = importlib.util.spec_from_file_location("v2", f"{PROJ}/{TOOL}")
-v2 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(v2)
+TOOL = sys.argv[3] if len(sys.argv) > 3 else "pdf_tool.py"
+os.makedirs(OUT, exist_ok=True)
+spec = importlib.util.spec_from_file_location("tool", os.path.join(PROJ, TOOL))
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
 SCALE = 2.0
 
 
@@ -58,7 +65,13 @@ def sorted_rect(r):
     return [min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3])]
 
 
-def plan(path):
+def plan(path, split):
+    """Values for every field, from pypdf's view of the form.
+
+    `split` is the tool's {old name: [new names]} for a text field drawn in
+    several differently labelled boxes. Each new name gets its own value, so
+    the checks below prove every box shows only what was sent for it.
+    """
     r = PdfReader(path)
     vals, skipped = {}, {}
     ws = widgets(r)
@@ -66,7 +79,18 @@ def plan(path):
         ft = str(f.get("/FT"))
         ff = int(f.get("/Ff") or 0)
         low = name.lower()
-        if ft == "/Tx":
+        if ft == "/Tx" and name in split:
+            w = [x for x in ws if x["name"] == name]
+            width = min((x["rect"][2] - x["rect"][0]) for x in w) if w else 100
+            ml = f.get("/MaxLen")
+            for n, new in enumerate(split[name]):
+                v = (
+                    f"V{i}{chr(65 + n)}"
+                    if width < 60
+                    else f"Val{i:02d}{chr(65 + n)} Test"
+                )
+                vals[new] = v[: int(ml)] if ml else v
+        elif ft == "/Tx":
             w = [x for x in ws if x["name"] == name]
             width = min((x["rect"][2] - x["rect"][0]) for x in w) if w else 100
             if "date" in low:
@@ -233,12 +257,18 @@ PAGE_W = [612.0]
 def check_form(path):
     tag = re.sub(r"[^A-Za-z0-9]+", "_", os.path.splitext(os.path.basename(path))[0])
     res = dict(form=os.path.basename(path), tag=tag, problems=[], notes=[])
-    vals, skipped = plan(path)
+    try:
+        split = tool.inspect_pdf_fields(path).get("split_fields") or {}
+    except Exception:
+        split = {}
+    if split:
+        res["split_fields"] = split
+    vals, skipped = plan(path, split)
     res["planned"] = len(vals)
     res["skipped"] = skipped
     if not vals:
         try:
-            pdf, unk = v2.fill_pdf_fields(path, {"x": "y"}, flatten=False)
+            pdf, unk = tool.fill_pdf_fields(path, {"x": "y"}, flatten=False)
             res["notes"].append(
                 f"no fillable fields; fill call returned {len(pdf)} bytes, unknown={unk}"
             )
@@ -250,15 +280,25 @@ def check_form(path):
     json.dump(vals, open(f"{OUT}/{tag}_values.json", "w"), indent=1)
 
     # ---------- editable fill ----------
-    pdf, unk = v2.fill_pdf_fields(path, vals, flatten=False)
+    pdf, unk = tool.fill_pdf_fields(path, vals, flatten=False)
     if unk:
         res["problems"].append(f"unknown fields reported: {unk}")
     r2 = PdfReader(io.BytesIO(pdf))
     f2 = r2.get_fields() or {}
     res["fields_after"] = len(f2)
     res["fields_before"] = len(PdfReader(path).get_fields() or {})
-    if res["fields_after"] != res["fields_before"]:
-        res["problems"].append("field count changed")
+    # A split field becomes one field per box, so the count may grow by that much.
+    expected = res["fields_before"] + sum(len(v) - 1 for v in split.values())
+    if res["fields_after"] != expected:
+        res["problems"].append(
+            f"field count changed: {res['fields_before']} before, {res['fields_after']} after, expected {expected}"
+        )
+    for old, news in split.items():
+        if old in f2:
+            res["problems"].append(f"split field {old!r} still present")
+        gone = [n for n in news if n not in f2]
+        if gone:
+            res["problems"].append(f"split field {old!r}: new fields missing {gone}")
     ws = widgets(r2)
     byname = {}
     for w in ws:
@@ -433,7 +473,7 @@ def check_form(path):
         res["problems"].append(f"whole-document check failed: {e!r}")
 
     # ---------- flattened fill ----------
-    fpdf, _ = v2.fill_pdf_fields(path, vals, flatten=True)
+    fpdf, _ = tool.fill_pdf_fields(path, vals, flatten=True)
     open(f"{OUT}/{tag}_flat.pdf", "wb").write(fpdf)
     rf = PdfReader(io.BytesIO(fpdf))
     nw = sum(
@@ -444,10 +484,9 @@ def check_form(path):
     )
     if "/AcroForm" in rf.trailer["/Root"] or nw:
         res["problems"].append(f"flatten left AcroForm/widgets ({nw})")
-    src_w = widgets(PdfReader(path))
-    srcby = {}
-    for w in src_w:
-        srcby.setdefault(w["name"], []).append(w)
+    # Boxes are taken from the editable copy: same places as the original,
+    # but under the new names when a field was split.
+    srcby = byname
     placed = total = 0
     misplaced = []
     dups = {}
@@ -561,6 +600,7 @@ for r in results:
         "gs_whole_document",
         "flat_text_in_box",
         "flat_checks_drawn",
+        "split_fields",
         "skipped",
     ):
         if k in r:

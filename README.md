@@ -5,7 +5,7 @@ inspect and fill the form fields (AcroForm) of a PDF attached to the chat,
 return the filled PDF as a downloadable attachment, and look at a page as an
 image.
 
-The whole tool is one file: `pdf_tool_pymupdf_v2.py`.
+The whole tool is one file: `pdf_tool.py`.
 
 ## What the model can do
 
@@ -14,6 +14,7 @@ The whole tool is one file: `pdf_tool_pymupdf_v2.py`.
 | `list_form_fields` | List every fillable field: name, type, the label printed next to the box, current value, and valid options. Also gives today's date, for date fields. |
 | `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model the pages it wrote to. Optionally flatten it. |
 | `render_page` | Hand one page to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
+| `flatten_form` | Flatten a copy that was already filled, so its values become fixed page content, without resending them. |
 
 Flat and scanned PDFs have no fields to fill. The tool reports that instead of
 drawing text over the page.
@@ -24,7 +25,7 @@ drawing text over the page.
    `requirements:` line on purpose, so Open WebUI will not try to install it.
    With a `uvx`-based systemd unit, add `--with pymupdf` to the command.
 2. In Open WebUI, go to **Admin > Tools > +**, paste the contents of
-   `pdf_tool_pymupdf_v2.py`, and save.
+   `pdf_tool.py`, and save.
 3. Enable the tool for a model (**Admin > Models > model > Tools**) or toggle
    it in the chat's **+** menu.
 
@@ -34,6 +35,7 @@ drawing text over the page.
 |---|---|---|
 | `flatten_by_default` | `false` | Flatten filled forms so values become fixed page content. |
 | `base_url` | empty | Public URL of the Open WebUI, used to build full download links. When empty, the WebUI URL from **Admin > Settings > General** is used, then the request host. |
+| `min_font_size` | `6.0` | Smallest size, in points, a value is shrunk to so it fits its box. A value that does not fit at this size is drawn cut off and reported, so the model can shorten it. |
 | `render_dpi` | `110` | Resolution of page images sent to the model (40 to 300). |
 | `render_max_kb` | `3000` | Largest page image sent to the model, in kilobytes. Larger pages are sent as JPEG or at lower resolution. |
 | `review_pages` | `3` | How many filled pages `fill_form` shows the model for checking (0 to 4). Only pages that were written to are shown. Needs Open WebUI 0.11.4 or later. |
@@ -143,7 +145,7 @@ The PDF helpers at the top of the file (`inspect_pdf_fields`,
 be used on their own:
 
 ```python
-from pdf_tool_pymupdf_v2 import inspect_pdf_fields, fill_pdf_fields
+from pdf_tool import inspect_pdf_fields, fill_pdf_fields
 
 print(inspect_pdf_fields("form.pdf"))
 pdf_bytes, unknown = fill_pdf_fields("form.pdf", {"Name": "Jane Doe"})
@@ -155,12 +157,12 @@ open("form-filled.pdf", "wb").write(pdf_bytes)
 The scripts in `tests/` read values back with pypdf and render pages with
 Ghostscript and Preview's engine, so the tool does not grade itself. They need
 `uv` and Ghostscript (`gs`); the Preview-engine checks need macOS. Sample PDFs
-are not included in this repository; the scripts expect them in the project
-folder.
+are not included in this repository; the scripts read them from the folder
+given as the project folder, and the tool file may be given by absolute path.
 
 ```
 uvx --with pymupdf --with pypdf --with pydantic --with pdfplumber --with pillow --with numpy \
-  python tests/harness.py . /tmp/pdf_out pdf_tool_pymupdf_v2.py
+  python tests/harness.py ~/pdf_maker /tmp/pdf_out $PWD/pdf_tool.py
 ```
 
 See [tests/README.md](tests/README.md) for all three suites and how to read

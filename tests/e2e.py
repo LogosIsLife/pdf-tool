@@ -1,10 +1,18 @@
-"""End-to-end and edge-case tests, with stand-ins for the Open WebUI modules."""
+"""End-to-end and edge-case tests, with stand-ins for the Open WebUI modules.
+
+Usage: python tests/e2e.py <project folder> <output folder> [tool file]
+
+The tool file is pdf_tool.py in the project folder unless given; an absolute
+path works too. The sample PDFs are read from the project folder.
+"""
 
 import sys, io, os, json, types, asyncio, importlib.util, shutil
 from pypdf import PdfReader
 import pdfplumber
 
-PROJ, OUT, TOOL = sys.argv[1], sys.argv[2], sys.argv[3]
+PROJ, OUT = sys.argv[1], sys.argv[2]
+TOOL = sys.argv[3] if len(sys.argv) > 3 else "pdf_tool.py"
+os.makedirs(OUT, exist_ok=True)
 
 # ---- stand-in Open WebUI modules -------------------------------------------------
 STORE = {}
@@ -63,7 +71,7 @@ for name, attrs in {
     m.__dict__.update(attrs)
     sys.modules[name] = m
 
-spec = importlib.util.spec_from_file_location("tool", f"{PROJ}/{TOOL}")
+spec = importlib.util.spec_from_file_location("tool", os.path.join(PROJ, TOOL))
 tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 T = tool.Tools()
@@ -377,13 +385,10 @@ if hasattr(tool, "inspect_pdf_fields"):
         ]
     }
     print("   listing Text7       :", json.dumps(L.get("Text7"))[:200])
-    L = {
-        e["name"]: e
-        for e in tool.inspect_pdf_fields(f"{PROJ}/CME Broadcast Consent Template.pdf")[
-            "fields"
-        ]
-    }
-    print("   listing Text1       :", json.dumps(L.get("Text1"))[:330])
+    I = tool.inspect_pdf_fields(f"{PROJ}/CME Broadcast Consent Template.pdf")
+    L = {e["name"]: e for e in I["fields"]}
+    print("   listing split       :", json.dumps(I.get("split_fields"))[:150])
+    print("   listing Text1_1     :", json.dumps(L.get("Text1_1"))[:330])
     L = {
         e["name"]: e
         for e in tool.inspect_pdf_fields(f"{PROJ}/00-985-filled copy.pdf")["fields"]
@@ -827,6 +832,453 @@ ok(
     "a caption of two lines over a box is read whole",
     lab.get("label_above") == "Spouse/ Partner",
     str(lab),
+)
+T.valves.review_pages = 3
+
+# 13 a field drawn in several differently labelled boxes is split, one field per box
+T.valves.review_pages = 0  # results as text
+src = f"{PROJ}/CME Broadcast Consent Template.pdf"
+fb = attach("CME Broadcast Consent Template.pdf", "f-bc")
+I = tool.inspect_pdf_fields(src)
+L = {e["name"]: e for e in I["fields"]}
+new_names = ["Text1_1", "Text1_2", "Text1_3", "Text1_4"]
+ok(
+    "the listing splits a shared field into one per box",
+    I.get("split_fields") == {"Text1": new_names}
+    and "Text1" not in L
+    and all(L.get(n, {}).get("split_from") == "Text1" for n in new_names)
+    and I["field_count"] == 5,
+    f"{I.get('split_fields')} count={I['field_count']}",
+)
+want = {
+    "Text1_1": "Topic of presentation",
+    "Text1_2": "Date of presentation",
+    "Text1_3": "Presenter Printed Name",
+    "Text1_4": "Date Signed",
+}
+ok(
+    "each split box is numbered top to bottom and keeps its own label",
+    {n: L.get(n, {}).get("label") for n in want} == want,
+    str({n: L.get(n, {}).get("label") for n in want}),
+)
+ok(
+    "the listing's note explains the split",
+    "split_fields" in I.get("note", "") and "split_from" in I.get("note", ""),
+    I.get("note", "")[-120:],
+)
+I2 = tool.inspect_pdf_fields(f"{PROJ}/CME Application Form 2026.pdf")
+ok(
+    "boxes that share one label stay one field",
+    "split_fields" not in I2
+    and {e["name"] for e in I2["fields"]} >= {"Text7", "Text8", "Text9", "Text10"},
+    str(I2.get("split_fields")),
+)
+rep_ = {}
+pdf, unk = tool.fill_pdf_fields(src, {"Text1": "x"}, report=rep_)
+ok(
+    "the old name of a split field is unknown and the split is reported",
+    unk == ["Text1"]
+    and rep_["filled"] == []
+    and rep_["split_fields"] == {"Text1": new_names},
+    f"unknown={unk} filled={rep_['filled']} split={rep_['split_fields']}",
+)
+o = json.loads(
+    run(T.fill_form(json.dumps({"Text1": "x"}), __user__=USER, __files__=[fb]))
+)
+ok(
+    "fill_form with only the old name fails and points at the new names",
+    o.get("status") == "failed"
+    and "file_id" not in o
+    and o.get("split_fields") == {"Text1": new_names}
+    and "split_fields" in o.get("next", "")
+    and "list_form_fields" in o.get("next", ""),
+    str(o)[:200],
+)
+o = json.loads(
+    run(
+        T.fill_form(
+            json.dumps({"Text1": "x", "Text1_3": "Dr. Doe"}),
+            __user__=USER,
+            __files__=[fb],
+        )
+    )
+)
+ok(
+    "the old name beside a new one makes the fill partial, with the split first",
+    o.get("status") == "partial"
+    and list(o)[:4] == ["status", "ignored_unknown_fields", "split_fields", "next"]
+    and o.get("filled_fields") == ["Text1_3"]
+    and o.get("next", "").startswith("The fields in split_fields"),
+    str(list(o)[:4]),
+)
+each = {
+    "Text1_1": "Sepsis Update",
+    "Text1_2": "10/15/2026",
+    "Text1_3": "Dr. Jane Doe",
+    "Text1_4": "10/04/2026",
+}
+rep_ = {}
+pdf, unk = tool.fill_pdf_fields(src, each, report=rep_)
+open(f"{OUT}/split_edit.pdf", "wb").write(pdf)
+f = PdfReader(io.BytesIO(pdf)).get_fields()
+ok(
+    "every split box holds only its own value",
+    not unk
+    and {k: f[k].get("/V") for k in each} == each
+    and "Text1" not in f
+    and not rep_["did_not_stick"]
+    and rep_["filled"] == list(each),
+    f"{ {k: f.get(k, {}).get('/V') for k in each} } stuck={rep_['did_not_stick']}",
+)
+d = pymupdf.open(stream=pdf, filetype="pdf")
+boxes = {w.field_name: w.rect for w in d[0].widgets() if w.field_name in each}
+d2 = pymupdf.open(
+    stream=tool.fill_pdf_fields(src, each, flatten=True)[0], filetype="pdf"
+)
+shown = {
+    n: d2[0].get_text("text", clip=r + (-2, -2, 2, 2)).strip() for n, r in boxes.items()
+}
+ok(
+    "flattened, each value is drawn in its own box and in no other",
+    all(each[n] in shown[n] for n in each)
+    and all(each[m] not in shown[n] for n in each for m in each if m != n),
+    str(shown),
+)
+rep_ = {}
+pdf2, unk = tool.fill_pdf_fields(
+    f"{OUT}/split_edit.pdf", {"Text1_2": "11/01/2026"}, report=rep_
+)
+f = PdfReader(io.BytesIO(pdf2)).get_fields()
+ok(
+    "a copy that was split is not split again, and keeps its names",
+    not unk
+    and not rep_["split_fields"]
+    and f["Text1_2"].get("/V") == "11/01/2026"
+    and f["Text1_1"].get("/V") == "Sepsis Update",
+    f"split={rep_['split_fields']} {f['Text1_2'].get('/V')!r}",
+)
+o = json.loads(run(T.fill_form(json.dumps(each), __user__=USER, __files__=[fb])))
+ok(
+    "fill_form with the new names is ok and reports the split",
+    o.get("status") == "ok"
+    and o.get("filled_fields") == list(each)
+    and o.get("split_fields") == {"Text1": new_names},
+    str({k: o.get(k) for k in ("status", "filled_fields", "split_fields")})[:200],
+)
+listing = json.loads(
+    run(T.list_form_fields(file_id=o["file_id"], __user__=USER, __files__=[fb]))
+)
+ok(
+    "the listing of the filled copy shows the new names with their values",
+    "split_fields" not in listing
+    and {e["name"]: e.get("value") for e in listing["fields"] if e["name"] in each}
+    == each,
+    str({e["name"]: e.get("value") for e in listing["fields"]})[:200],
+)
+
+# 14 text is shrunk to fit, never below the floor, and a value that still does not fit is reported
+W = lambda size, rect, flags=0: types.SimpleNamespace(
+    text_fontsize=size, rect=pymupdf.Rect(*rect), field_flags=flags
+)
+ok(
+    "_fitted_size leaves a value alone when the form's size is fine",
+    tool._fitted_size(W(11.0, (0, 0, 200, 20)), "hello") == (None, True),
+    str(tool._fitted_size(W(11.0, (0, 0, 200, 20)), "hello")),
+)
+size, fits = tool._fitted_size(W(11.0, (0, 0, 100, 20)), "a fairly long value here")
+ok(
+    "_fitted_size shrinks a long value until it fits",
+    fits and size is not None and 6.0 <= size < 11.0,
+    f"{size} fits={fits}",
+)
+ok(
+    "_fitted_size stops at the floor and says the value does not fit",
+    tool._fitted_size(W(11.0, (0, 0, 100, 20)), "x" * 400) == (6.0, False)
+    and tool._fitted_size(W(11.0, (0, 0, 100, 20)), "x" * 400, floor=9.0)
+    == (9.0, False),
+    str(tool._fitted_size(W(11.0, (0, 0, 100, 20)), "x" * 400)),
+)
+ML = pymupdf.PDF_TX_FIELD_IS_MULTILINE
+two = (
+    "Review the guidelines for sepsis management and discuss the evidence base "
+    "for early antibiotics and fluids"
+)
+size, fits = tool._fitted_size(W(12.0, (0, 0, 367, 22), ML), two)
+ok(
+    "_fitted_size wraps a multiline value and shrinks it so every line fits the height",
+    fits and size is not None and 6.0 <= size < 12.0,
+    f"{size} fits={fits}",
+)
+ok(
+    "_fitted_size shrinks a declared size taller than its box",
+    tool._fitted_size(W(11.0, (0, 0, 100, 8)), "abc")[1]
+    and tool._fitted_size(W(11.0, (0, 0, 100, 8)), "abc")[0] < 8,
+    str(tool._fitted_size(W(11.0, (0, 0, 100, 8)), "abc")),
+)
+src = f"{PROJ}/CME Application Form 2026.pdf"
+rep_ = {}
+pdf, _ = tool.fill_pdf_fields(src, {"Text7": two}, report=rep_)
+d = pymupdf.open(stream=pdf, filetype="pdf")
+w = next(w for w in d[0].widgets() if w.field_name == "Text7")
+ok(
+    "a two-line value is shrunk, fits, and the size is kept in the box's own DA",
+    rep_["shrunk"].get("Text7")
+    and 6.0 <= rep_["shrunk"]["Text7"] < 12.0
+    and not rep_["cut_off"]
+    and not rep_["did_not_stick"]
+    and w.text_fontsize == rep_["shrunk"]["Text7"]
+    and f"{rep_['shrunk']['Text7']:g} Tf" in tool._get(d, w.xref, "DA")[1],
+    f"shrunk={rep_['shrunk']} cut_off={rep_['cut_off']} DA={tool._get(d, w.xref, 'DA')[1]!r}",
+)
+d2 = pymupdf.open(
+    stream=tool.fill_pdf_fields(src, {"Text7": two}, flatten=True)[0], filetype="pdf"
+)
+ok(
+    "flattened, the whole two-line value sits inside its box",
+    " ".join(d2[0].get_text("text", clip=w.rect + (-2, -2, 2, 2)).split()) == two,
+    repr(d2[0].get_text("text", clip=w.rect + (-2, -2, 2, 2)))[:120],
+)
+huge = " ".join(f"word{i}" for i in range(120))
+rep_ = {}
+pdf, _ = tool.fill_pdf_fields(src, {"Text7": huge}, report=rep_)
+d = pymupdf.open(stream=pdf, filetype="pdf")
+w = next(w for w in d[0].widgets() if w.field_name == "Text7")
+ok(
+    "a value that cannot fit is drawn at the floor and reported as cut off",
+    rep_["shrunk"] == {"Text7": 6.0}
+    and rep_["cut_off"] == ["Text7"]
+    and "Text7" in rep_["filled"]
+    and not rep_["did_not_stick"]
+    and w.text_fontsize == 6.0,
+    f"shrunk={rep_['shrunk']} cut_off={rep_['cut_off']} fs={w.text_fontsize}",
+)
+rep_ = {}
+tool.fill_pdf_fields(src, {"Text7": huge}, report=rep_, min_font_size=9.0)
+ok(
+    "min_font_size is the floor",
+    rep_["shrunk"] == {"Text7": 9.0} and rep_["cut_off"] == ["Text7"],
+    f"shrunk={rep_['shrunk']} cut_off={rep_['cut_off']}",
+)
+rep_ = {}
+tool.fill_pdf_fields(src, {"Text7": two}, report=rep_, min_font_size=9.0)
+ok(
+    "a value that needs less than the floor is drawn at the floor and reported",
+    rep_["shrunk"] == {"Text7": 9.0} and rep_["cut_off"] == ["Text7"],
+    f"shrunk={rep_['shrunk']} cut_off={rep_['cut_off']}",
+)
+
+
+def ink_below(src_path, name, value, flatten=True, dpi=144):
+    """Pixels that change below the box, and inside it, between the blank form and a filled copy."""
+    import numpy as np
+
+    blank = pymupdf.open(src_path)
+    pg, w = next((p, w) for p in blank for w in p.widgets() if w.field_name == name)
+    filled = pymupdf.open(
+        stream=tool.fill_pdf_fields(src_path, {name: value}, flatten=flatten)[0],
+        filetype="pdf",
+    )
+    k = dpi / 72
+    a, b = pg.get_pixmap(dpi=dpi), filled[pg.number].get_pixmap(dpi=dpi)
+    A = np.frombuffer(a.samples, dtype=np.uint8).reshape(a.h, a.w, a.n).astype(int)
+    B = np.frombuffer(b.samples, dtype=np.uint8).reshape(b.h, b.w, b.n).astype(int)
+    xs = slice(int(w.rect.x0 * k), int(w.rect.x1 * k))
+    below = (slice(int((w.rect.y1 + 1) * k), int((w.rect.y1 + 30) * k)), xs)
+    inside = (slice(int((w.rect.y0 + 1) * k), int((w.rect.y1 - 1) * k)), xs)
+    diff = lambda s: int((np.abs(A[s] - B[s]).sum(axis=2) > 60).sum())
+    return diff(below), diff(inside)
+
+
+src = f"{PROJ}/205_boc_test.pdf"
+name = "Supplemental Provisions/Information:"
+below, inside = ink_below(src, name, " ".join(f"word{i}" for i in range(60)))
+ok(
+    "wrapped text that fits is drawn inside its box and nothing below it",
+    below == 0 and inside > 1000,
+    f"below={below} inside={inside}",
+)
+below, inside = ink_below(src, name, " ".join(f"word{i}" for i in range(900)))
+ok(
+    "wrapped text that is cut off still stops at the bottom of its box",
+    below == 0 and inside > 1000,
+    f"below={below} inside={inside}",
+)
+below, inside = ink_below(src, name, " ".join(f"word{i}" for i in range(900)), False)
+ok(
+    "the same holds for the editable copy",
+    below == 0 and inside > 1000,
+    f"below={below} inside={inside}",
+)
+o = json.loads(
+    run(
+        T.fill_form(
+            json.dumps({"Text7": huge, "Text1": "A title"}),
+            __user__=USER,
+            __files__=[f6],
+        )
+    )
+)
+ok(
+    "fill_form reports a cut-off value as a problem, first, and still makes the file",
+    o.get("status") == "partial"
+    and list(o)[:3] == ["status", "text_cut_off", "next"]
+    and "shorten" in o.get("text_cut_off", {}).get("Text7", "")
+    and "6.0 pt" in o.get("text_cut_off", {}).get("Text7", "")
+    and o.get("file_id")
+    and o.get("filled_fields") == ["Text7", "Text1"]
+    and o.get("small_text_pt") == {"Text7": 6.0},
+    str({k: o.get(k) for k in ("status", "text_cut_off", "small_text_pt")})[:200],
+)
+ok(
+    "the next step says to shorten it and not to call the form complete",
+    o.get("next", "").startswith("The values in text_cut_off")
+    and "Shorten them" in o.get("next", "")
+    and "Do not tell the user the form is complete" in o.get("next", "")
+    and "Some values were NOT written" not in o.get("next", ""),
+    o.get("next", "")[:160],
+)
+T.valves.min_font_size = 9
+o = json.loads(
+    run(T.fill_form(json.dumps({"Text7": huge}), __user__=USER, __files__=[f6]))
+)
+T.valves.min_font_size = 6.0
+ok(
+    "the min_font_size valve is used",
+    o.get("small_text_pt") == {"Text7": 9.0}
+    and "9.0 pt" in o.get("text_cut_off", {}).get("Text7", ""),
+    str({k: o.get(k) for k in ("small_text_pt", "text_cut_off")})[:160],
+)
+o = json.loads(
+    run(T.fill_form(json.dumps({"Text7": two}), __user__=USER, __files__=[f6]))
+)
+ok(
+    "a shrunk value that fits is ok, with its size in small_text_pt",
+    o.get("status") == "ok"
+    and "text_cut_off" not in o
+    and 6.0 <= o.get("small_text_pt", {}).get("Text7", 0) < 12.0,
+    str({k: o.get(k) for k in ("status", "small_text_pt")}),
+)
+
+# 15 flatten_form: a filled copy is flattened without resending its values
+o = json.loads(run(T.fill_form("{}", __user__=USER, __files__=[f5])))
+ok(
+    "fill_form with no values and no flatten -> error that names flatten_form",
+    "non-empty" in o.get("error", "") and "flatten_form" in o.get("error", ""),
+    o.get("error", "")[:120],
+)
+o = json.loads(run(T.fill_form("", __user__=USER, __files__=[f5])))
+ok(
+    "fill_form with an empty string is the same error",
+    "flatten_form" in o.get("error", ""),
+)
+sent = {"City:": "Waco", "Street address of registered agent:": "1 Main St"}
+first = json.loads(run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])))
+before = len(STORE)
+o = json.loads(
+    run(T.flatten_form(file_id=first["file_id"], __user__=USER, __files__=[f5]))
+)
+ok(
+    "flatten_form is ok, flattened, and names the copy -flattened",
+    o.get("status") == "ok"
+    and o.get("flattened") is True
+    and o.get("file_name") == "205_boc_test-filled-flattened.pdf"
+    and o.get("file_id")
+    and len(STORE) == before + 1,
+    str({k: o.get(k) for k in ("status", "flattened", "file_name", "error")}),
+)
+ok(
+    "flatten_form writes no values and touches no page",
+    o.get("filled_fields") == [] and o.get("pages_touched") == [],
+    str({k: o.get(k) for k in ("filled_fields", "pages_touched")}),
+)
+if o.get("file_id"):
+    r = PdfReader(STORE[o["file_id"]].path)
+    txt = r.pages[0].extract_text()
+    nw = sum(
+        1
+        for p in r.pages
+        for a in (p.get("/Annots") or [])
+        if a.get_object().get("/Subtype") == "/Widget"
+    )
+    ok(
+        "the flattened copy keeps the values as page content and has no fields left",
+        not r.get_fields()
+        and nw == 0
+        and "/AcroForm" not in r.trailer["/Root"]
+        and "Waco" in txt
+        and "1 Main St" in txt,
+        f"fields={r.get_fields()} widgets={nw} Waco={'Waco' in txt}",
+    )
+ok(
+    "the empty fields of a flattened copy point back at the copy before flattening",
+    o.get("still_empty")
+    and "City:" not in str(o.get("still_empty"))
+    and "cannot be filled" in o.get("next", "")
+    and f'file_id "{first["file_id"]}"' in o.get("next", "")
+    and "flatten=true" in o.get("next", ""),
+    o.get("next", "")[:200],
+)
+o = json.loads(run(T.fill_form("{}", flatten=True, __user__=USER, __files__=[f5])))
+ok(
+    "fill_form with {} and flatten=true flattens the attached PDF as it is",
+    o.get("status") == "ok"
+    and o.get("flattened") is True
+    and o.get("file_name") == "205_boc_test-flattened.pdf"
+    and o.get("filled_fields") == [],
+    str({k: o.get(k) for k in ("status", "file_name", "error")}),
+)
+o = json.loads(
+    run(
+        T.flatten_form(
+            file_id=first["file_id"], output_name="done", __user__=USER, __files__=[f5]
+        )
+    )
+)
+ok(
+    "flatten_form takes an output name",
+    o.get("file_name") == "done.pdf",
+    o.get("file_name"),
+)
+o = json.loads(
+    run(
+        T.fill_form(
+            json.dumps({"Text1": "A title"}),
+            flatten=True,
+            __user__=USER,
+            __files__=[f6],
+        )
+    )
+)
+ok(
+    "fill with flatten=true names the copy -filled and sends empties back to the original",
+    o.get("status") == "ok"
+    and o.get("file_name") == "CME Application Form 2026-filled.pdf"
+    and o.get("filled_fields") == ["Text1"]
+    and 'file_id "f-app"' in o.get("next", "")
+    and "the copy before flattening" in o.get("next", ""),
+    o.get("next", "")[:200],
+)
+o = json.loads(run(T.flatten_form(file_id="f-other", __user__=USER, __files__=[])))
+ok("flatten_form refuses another user's file", "another user" in o.get("error", ""))
+o = json.loads(run(T.flatten_form(__user__=USER, __files__=[f1, f5])))
+ok(
+    "flatten_form with several PDFs asks for file_id",
+    "Several PDFs" in o.get("error", ""),
+)
+o = json.loads(run(T.flatten_form(__user__=USER, __files__=[f3])))
+ok(
+    "flatten_form on a flat PDF -> readable error",
+    "no fillable fields" in o.get("error", ""),
+)
+
+# 16 the listing tells the model what it cannot fill
+listing = json.loads(run(T.list_form_fields(__user__=USER, __files__=[f5])))
+ok(
+    "the listing says a printed line with no field cannot be filled by the tool",
+    "cannot be filled by this tool" in listing.get("note", "")
+    and "completed by hand" in listing.get("note", "")
+    and "split_fields" not in listing.get("note", ""),
+    listing.get("note", "")[-200:],
 )
 T.valves.review_pages = 3
 
