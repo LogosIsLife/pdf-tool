@@ -1,7 +1,7 @@
 """
 title: PDF Form Filler (PyMuPDF)
 author: darlene
-version: 1.2.0
+version: 1.3.0
 license: AGPL-3.0
 description: Inspect and fill the form fields (AcroForm) of a PDF attached to the chat, return the filled PDF as a downloadable attachment, and show a page to the model as an image.
 """
@@ -29,6 +29,7 @@ import json
 import os
 import re
 import uuid
+from datetime import date
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -418,6 +419,9 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
             ("Assignor Entity Name"), used only when there is no left label
     right - text after the box: primary for a checkbox/radio square
             ("[ ] a. The right to..."), a fallback for other boxes
+    above - a caption printed over the box, used for a checkbox/radio square
+            that has no other label ("Denied" over its square)
+    A box inside a table gets its column heading from _table_labels instead.
     """
 
     def phrases(words, gap=6.0):
@@ -436,7 +440,8 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
     h = bottom - top
     mid = (top + bottom) / 2
     on_line = [w for w in page_words if abs((w[1] + w[3]) / 2 - mid) <= h * 0.6]
-    left = phrases([w for w in on_line if w[2] <= x1 - 1 and w[0] >= x1 - 300])
+    # A label may run up to the box or a little into it ("Sponsor:|___").
+    left = phrases([w for w in on_line if w[2] <= x1 + 3 and w[0] < x1 - 1 and w[0] >= x1 - 300])
     right = phrases([w for w in on_line if w[0] >= x2 + 1 and w[0] <= x2 + 300])
     below = phrases(
         [
@@ -447,6 +452,19 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
             and (w[3] - w[1]) <= body_h * 0.85
         ]
     )
+    over = [w for w in page_words if w[3] <= top + 1 and w[2] >= x1 - 6 and w[0] <= x2 + 6]
+    above: list[str] = []
+    edge, reach = top, 16.0
+    for _ in range(3):
+        # The nearest line, then the lines stacked right on it ("Spouse/" over "Partner").
+        line = [w for w in over if edge - reach <= w[3] <= edge + 1]
+        if not line:
+            break
+        near = max(w[3] for w in line)
+        line = [w for w in line if near - w[3] <= 3]
+        above = phrases(line) + above
+        edge, reach = min(w[1] for w in line), 4.0
+        over = [w for w in over if w[3] <= edge + 1 and w not in line]
     entry: dict[str, str] = {}
     if left:
         entry["label_left"] = _clean_label(left[-1])
@@ -454,7 +472,62 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
         entry["label_below"] = _clean_label(" ".join(below))
     if right:
         entry["label_right"] = _clean_label(right[0])
+    if above:
+        entry["label_above"] = _clean_label(" ".join(above))
     return entry
+
+
+def _table_labels(page, widgets) -> dict[int, str]:
+    """For each box inside a table, its column heading and row: {xref: "Self, row 2"}.
+
+    Only a fallback for a box with no text beside it: a ruled frame around a
+    block of boxes also passes for a table, and its heading is not a label.
+    """
+    mu = _mu()
+    try:
+        if hasattr(mu, "no_recommend_layout"):
+            mu.no_recommend_layout()
+        tables = page.find_tables().tables
+    except Exception:
+        return {}
+    out: dict[int, str] = {}
+    for table in tables:
+        try:
+            names = [_clean_label(str(n or "").replace("/\n", "/")) for n in table.header.names]
+            rows = list(table.rows)
+            body = rows if table.header.external else rows[1:]
+        except Exception:
+            continue
+        for number, row in enumerate(body, start=1):
+            for column, cell in enumerate(row.cells):
+                if cell is None or column >= len(names) or not names[column]:
+                    continue
+                x0, y0, x1, y1 = cell
+                for w in widgets:
+                    r = w.rect
+                    if x0 <= (r.x0 + r.x1) / 2 <= x1 and y0 <= (r.y0 + r.y1) / 2 <= y1:
+                        out[w.xref] = names[column] + (f", row {number}" if len(body) > 1 else "")
+    return out
+
+
+def _printed_words(page, widgets) -> list:
+    """The words printed on the page, without the values typed into its boxes.
+
+    The page text includes what the boxes show, and a value ("Austin") would
+    pass for the label of the box next to it.
+    """
+    mu = _mu()
+    typed = (mu.PDF_WIDGET_TYPE_TEXT, mu.PDF_WIDGET_TYPE_COMBOBOX, mu.PDF_WIDGET_TYPE_LISTBOX)
+    filled = [w.rect for w in widgets if w.field_type in typed and w.field_value not in (None, "", [])]
+    out = []
+    for w in page.get_text("words"):
+        if set(w[4]) <= set("_.-"):
+            continue
+        x, y = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+        if any(r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1 for r in filled):
+            continue
+        out.append(w)
+    return out
 
 
 def _collect(doc) -> dict[str, list[dict[str, Any]]]:
@@ -468,11 +541,12 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
         if not widgets:
             continue
         try:
-            words = [w for w in page.get_text("words") if not set(w[4]) <= set("_.-")]
+            words = _printed_words(page, widgets)
         except Exception:
             words = []
         heights = sorted(w[3] - w[1] for w in words) or [10.0]
         body_h = heights[len(heights) // 2]
+        in_table: Optional[dict[int, str]] = None
         for w in widgets:
             name = w.field_name
             if not name:
@@ -487,6 +561,11 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
                 info.update(_widget_label(words, body_h, w.rect))
             except Exception:
                 pass
+            if not any(info.get(k) for k in ("label_left", "label_below", "label_right")):
+                if in_table is None:
+                    in_table = _table_labels(page, widgets)
+                if in_table.get(w.xref):
+                    info["label_table"] = in_table[w.xref]
             tip = _inherited(doc, w.xref, "TU")
             if tip[0] == "string" and _clean_label(tip[1]):
                 info["tooltip"] = _clean_label(tip[1])
@@ -509,7 +588,18 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
         doc.close()
 
     def _label(b):
-        return b.get("label_left") or b.get("label_below") or b.get("label_right") or ""
+        return b.get("label_left") or b.get("label_below") or b.get("label_right") or b.get("label_table") or ""
+
+    def _box_label(b):
+        # A checkbox or radio square: its text follows it; "A." before it is only a marker.
+        return (
+            b.get("label_right")
+            or b.get("label_left")
+            or b.get("label_below")
+            or b.get("label_table")
+            or b.get("label_above")
+            or ""
+        )
 
     out = []
     for name, group in boxes.items():
@@ -529,18 +619,21 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
                 "/Off",
             )
             if len(group) == 1:
-                if _label(group[0]):
-                    entry["label"] = _label(group[0])
+                if _box_label(group[0]):
+                    entry["label"] = _box_label(group[0])
                 entry["options"] = states + ["/Off"]
             else:
                 # One field with several boxes: a radio group. List each option.
                 entry["options"] = [
                     {
                         "value": b.get("on_value"),
-                        "label": b.get("label_right") or b.get("label_left") or b.get("label_below") or "",
+                        "label": _box_label(b),
                     }
                     for b in group
                 ]
+            tip = group[0].get("tooltip")
+            if tip and tip != name and tip != entry.get("label"):
+                entry["tooltip"] = tip
             entry["value"] = current
         else:
             labels: list[str] = []
@@ -569,7 +662,9 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
         "fields": out,
         "note": (
             "Use 'label' (the text printed on the form next to or under the box) and 'tooltip' (the form's own "
-            "description of the box) to decide what each field is for; fill by 'name', copied exactly."
+            "description of the box) to decide what each field is for; fill by 'name', copied exactly. "
+            "Leave out a field the form does not require or that does not apply; never write filler such as "
+            "'None' or 'N/A' into it."
         ),
     }
 
@@ -662,6 +757,8 @@ def render_pdf_page(
 
 _TRUE_WORDS = {"true", "yes", "y", "on", "x", "1", "checked", "check", "selected"}
 _FALSE_WORDS = {"false", "no", "n", "off", "0", "unchecked", "uncheck", "none", ""}
+# Text a model writes into a box it has nothing to say in, compared after _key_norm.
+_FILLER = {"none", "na", "notapplicable", "nil", "null", "blank"}
 
 
 def _key_norm(text: Any) -> str:
@@ -834,9 +931,35 @@ def _fitted_size(widget, value: str) -> Optional[float]:
     return round(max(floor, size), 2)
 
 
+def _clear_value(doc, widget) -> None:
+    """Empty a text or choice box: no stored value, nothing drawn.
+
+    PyMuPDF skips an empty value, which would leave the old one in place.
+    """
+    holder = widget.xref
+    for _ in range(20):
+        # A box without a name of its own leaves the value to its parent.
+        kind, value = _get(doc, holder, "Parent")
+        if _get(doc, holder, "T")[0] != "null" or kind != "xref" or not _refs(value):
+            break
+        holder = _refs(value)[0]
+    for xref in {holder, widget.xref}:
+        for key in ("V", "RV", "I"):
+            if _get(doc, xref, key)[0] != "null":
+                doc.xref_set_key(xref, key, "()" if key == "V" and xref == holder else "null")
+    if _get(doc, holder, "V")[0] == "null":
+        doc.xref_set_key(holder, "V", "()")
+    kind, value = _get(doc, widget.xref, "AP/N")
+    if kind == "xref" and _refs(value):
+        doc.update_stream(_refs(value)[0], b"/Tx BMC\nEMC\n")
+
+
 def _draw_value(doc, widget, value) -> None:
     """Set a text or choice value and draw it, keeping the form's own font setting."""
     mu = _mu()
+    if value in (None, "", []):
+        _clear_value(doc, widget)
+        return
     size = None
     if widget.field_type == mu.PDF_WIDGET_TYPE_TEXT and value:
         size = _fitted_size(widget, str(value))
@@ -1087,7 +1210,8 @@ def fill_pdf_fields(
     Pass a list as `rejected` to receive values that matched none of a field's
     options; those fields are left as they were. Pass a dict as `report` to
     receive what was written and whether it reads back: filled, remapped,
-    blank, ambiguous, did_not_stick, still_empty, pages_touched.
+    blank, replaced, filler, ambiguous, did_not_stick, still_empty,
+    pages_touched.
     """
     mu = _mu()
     doc = _prepared(path)
@@ -1108,6 +1232,7 @@ def fill_pdf_fields(
         if rejected is not None:
             rejected.extend(bad)
 
+        had = {k: str(boxes[k][0]["value"] or "").strip() for k in clean}
         buttons = (mu.PDF_WIDGET_TYPE_CHECKBOX, mu.PDF_WIDGET_TYPE_RADIOBUTTON)
         for page in doc:
             widgets = [w for w in page.widgets() if w.field_name in clean]
@@ -1146,12 +1271,19 @@ def fill_pdf_fields(
                     for k, v in clean.items()
                 ]
             failed = {d["field"] for d in did_not_stick}
+            typed = [k for k in clean if k not in failed and boxes[k][0]["kind"] in ("text", "choice")]
+            blank = [k for k in typed if not clean[k].strip()]
+            # A box left blank on purpose is not one that was forgotten.
+            empty = {p: [n for n in names if n not in blank] for p, names in empty.items()}
+            empty = {p: names for p, names in empty.items() if names}
             report.update(
                 {
                     "filled": [k for k in clean if k not in failed],
-                    "blank": [
-                        k for k, v in clean.items() if not v.strip() and boxes[k][0]["kind"] in ("text", "choice")
-                    ],
+                    "blank": blank,
+                    "replaced": {
+                        k: had[k] for k in typed if had[k] and had[k] != clean[k].strip()
+                    },
+                    "filler": [k for k in typed if boxes[k][0]["kind"] == "text" and _key_norm(clean[k]) in _FILLER],
                     "remapped": remapped,
                     "ambiguous": ambiguous,
                     "did_not_stick": did_not_stick,
@@ -1281,7 +1413,7 @@ class Tools:
         try:
             fid, path, name = await self._pick_file(file_id, __files__, (__user__ or {}).get("id"))
             info = inspect_pdf_fields(path)
-            info.update({"file_id": fid, "file_name": name})
+            info.update({"file_id": fid, "file_name": name, "today": date.today().isoformat()})
             if info["field_count"] == 0:
                 info["note"] = (
                     "This PDF has no fillable fields (flat or scanned form). "
@@ -1377,7 +1509,10 @@ class Tools:
         the result, call list_form_fields, and call fill_form again with the
         returned file_id and only the missing fields. Do not ask the user
         about a field this tool already flagged. still_empty lists the fields
-        that hold no value: fill the ones the request covers. Before telling the user the
+        that hold no value: fill the ones the request covers. Leave out a
+        field the form does not require or that does not apply; never write
+        filler such as "None" or "N/A" into it. To empty a field that holds
+        a value, send "" for it. Before telling the user the
         form is complete, look at every page in pages_touched: either in
         page_images of this result, or with render_page. If a value is missing
         on the image, call fill_form again.
@@ -1533,6 +1668,12 @@ class Tools:
                     "Look at page_images and compare every value with what was asked. "
                     "If one is missing or cut off, call fill_form again."
                 )
+            filler = report.get("filler") or []
+            if filler:
+                steps.append(
+                    "The values in filler_values look like filler. Unless the user asked for that text, call "
+                    f'fill_form again with file_id "{new_id}" and "" for those fields to empty them.'
+                )
             still_empty = report.get("still_empty") or {}
             if still_empty:
                 steps.append(
@@ -1567,6 +1708,11 @@ class Tools:
             if report.get("blank"):
                 # An empty value counts as filled; say so, or the box looks like a failed write.
                 result["left_blank_as_sent"] = report["blank"]
+            if report.get("replaced"):
+                # What the form held before, so a value written over can be told to the user.
+                result["replaced_values"] = report["replaced"]
+            if filler:
+                result["filler_values"] = filler
             if images:
                 # Returned as a dict: Open WebUI takes the pictures out for the
                 # model and turns the rest into JSON text.

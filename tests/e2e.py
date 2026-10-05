@@ -214,4 +214,47 @@ T.valves.review_pages = 0
 ok('review_pages=0 sends no images', isinstance(run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5])), str))
 T.valves.review_pages = 3
 
+# 12 emptying a box, filler, values written over, and what the listing says
+T.valves.review_pages = 0  # results as text
+src = f'{PROJ}/205_boc_test.pdf'
+held = {'City:': 'Zzyzx', 'Supplemental Provisions/Information:': 'None.', 'Organization Name:': 'N/A', 'Last Name of Governing Person:': 'Nance'}
+rep_ = {}; pdf, _ = tool.fill_pdf_fields(src, held, report=rep_); open(f'{OUT}/held.pdf', 'wb').write(pdf)
+ok('filler is named, a real value is not', rep_.get('filler') == ['Supplemental Provisions/Information:', 'Organization Name:'], str(rep_.get('filler')))
+for flat in (False, True):
+    rep_ = {}; pdf, _ = tool.fill_pdf_fields(f'{OUT}/held.pdf', {'Supplemental Provisions/Information:': '', 'City:': ''}, flatten=flat, report=rep_)
+    d = pymupdf.open(stream=pdf, filetype='pdf'); shown = d[0].get_text() + d[1].get_text()
+    ok(f'an empty value empties the box (flatten={flat})', not rep_['did_not_stick'] and 'None.' not in shown and 'Zzyzx' not in shown and 'Nance' in shown, f"{rep_['did_not_stick']} None.={'None.' in shown} Zzyzx={'Zzyzx' in shown}")
+    if not flat:
+        f = PdfReader(io.BytesIO(pdf)).get_fields()
+        ok('the emptied box holds no value, the others keep theirs', not f['City:'].get('/V') and not f['Supplemental Provisions/Information:'].get('/V') and f['Last Name of Governing Person:'].get('/V') == 'Nance', f"{f['City:'].get('/V')!r} {f['Last Name of Governing Person:'].get('/V')!r}")
+        ok('an emptied box is left blank as sent, not still empty', rep_['blank'] == ['Supplemental Provisions/Information:', 'City:'] and not {'City:', 'Supplemental Provisions/Information:'} & {n for v in rep_['still_empty'].values() for n in v}, str(rep_['blank']))
+        ok('the value that was there is reported', rep_['replaced'] == {'Supplemental Provisions/Information:': 'None.', 'City:': 'Zzyzx'}, str(rep_['replaced']))
+        open(f'{OUT}/emptied.pdf', 'wb').write(pdf)
+rep_ = {}; pdf, _ = tool.fill_pdf_fields(f'{OUT}/emptied.pdf', {'City:': 'Waco'}, report=rep_)
+ok('an emptied box can be filled again', not rep_['did_not_stick'] and PdfReader(io.BytesIO(pdf)).get_fields()['City:'].get('/V') == 'Waco', str(rep_['did_not_stick']))
+f6 = attach('CME Application Form 2026.pdf', 'f-app')
+o = json.loads(run(T.fill_form(json.dumps({'Text7': 'Review the guidelines', 'Text8': 'N/A', 'Text13': ''}), __user__=USER, __files__=[f6])))
+ok('fill_form names the value written over and the filler', o.get('status') == 'ok' and o.get('replaced_values') == {'Text7': 'lijlkjkl'} and o.get('filler_values') == ['Text8'] and 'filler_values' in o.get('next', ''), str({k: o.get(k) for k in ('status', 'replaced_values', 'filler_values')}))
+ok('only boxes left out are still empty', 'Text13' not in o.get('still_empty', {}).get('page 1', []) and 'Text14' in o.get('still_empty', {}).get('page 1', []), str(o.get('still_empty')))
+o = json.loads(run(T.fill_form(json.dumps({f'Text{n}': 'x' for n in range(1, 13)} | {f'Text{n}': '' for n in range(13, 17)}), __user__=USER, __files__=[f6])))
+ok('nothing still empty -> no still_empty step', 'still_empty' not in o and 'still_empty' not in o.get('next', ''), o.get('next', '')[:120])
+listing = json.loads(run(T.list_form_fields(__user__=USER, __files__=[f6]))); L = {e['name']: e for e in listing['fields']}
+want = {'Text1': 'Title of Course', 'Text2': 'Name of Sponsor', 'Text6': 'Target Audience', 'Text12': 'Name of Instructor(s)', 'Check Box17': 'Denied', 'Check Box18': 'Approved'}
+ok('a label that runs up to its box is whole; a caption over a checkbox is its label', {k: L[k].get('label') for k in want} == want, str({k: L[k].get('label') for k in want}))
+import datetime
+ok('the listing gives the date', listing.get('today') == datetime.date.today().isoformat(), str(listing.get('today')))
+L = {e['name']: e for e in tool.inspect_pdf_fields(f'{PROJ}/205_boc_test.pdf')['fields']}
+ok('a checkbox is labelled by the text after it, and has its tooltip', L['document']['label'].startswith('This document becomes effective') and L['registered'].get('tooltip', '').startswith('If the initial registered agent'), f"{L['document'].get('label')!r} {L['registered'].get('tooltip')!r}"[:160])
+blank_l = {e['name']: e.get('label') for e in tool.inspect_pdf_fields(src)['fields']}
+held_l = {e['name']: e.get('label') for e in tool.inspect_pdf_fields(f'{OUT}/held.pdf')['fields']}
+ok('labels are the same on a filled copy', held_l == blank_l, str({k: (blank_l[k], v) for k, v in held_l.items() if blank_l[k] != v})[:200])
+L = {e['name']: e.get('label') for e in tool.inspect_pdf_fields(f'{PROJ}/CME Disclosure Form Template.pdf')['fields']}
+want = {'Check Box12': 'Self, row 1', 'Check Box13': 'Self, row 2', 'Check Box14': 'Spouse/Partner, row 1', 'Check Box15': 'Spouse/Partner, row 2',
+        'Nature of Financial RelationshipRow2': 'Nature of Financial Relationship, row 2', 'Check Box1': 'Live', 'Check Box7': 'Presenter', 'Text4': 'Name'}
+ok('a box in a table is labelled by its column heading and row', {k: L.get(k) for k in want} == want, str({k: L.get(k) for k in want if L.get(k) != want[k]}))
+words = [(10, 0, 40, 10, 'Spouse/'), (10, 11, 40, 21, 'Partner'), (10, -30, 60, -20, 'Unrelated'), (200, 11, 230, 21, 'Other')]
+lab = tool._widget_label(words, 10.0, pymupdf.Rect(15, 25, 33, 43))
+ok('a caption of two lines over a box is read whole', lab.get('label_above') == 'Spouse/ Partner', str(lab))
+T.valves.review_pages = 3
+
 n = sum(1 for r in results if r[1]); print(f'\n{TOOL}: {n}/{len(results)} passed'); [print('   FAILED:', r[0], '|', r[2]) for r in results if not r[1]]

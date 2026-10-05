@@ -11,7 +11,7 @@ The whole tool is one file: `pdf_tool_pymupdf_v2.py`.
 
 | Function | Purpose |
 |---|---|
-| `list_form_fields` | List every fillable field: name, type, the label printed next to the box, current value, and valid options. |
+| `list_form_fields` | List every fillable field: name, type, the label printed next to the box, current value, and valid options. Also gives today's date, for date fields. |
 | `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model the pages it wrote to. Optionally flatten it. |
 | `render_page` | Hand one page to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
 
@@ -85,7 +85,16 @@ value after the fill, so a field the model left out of its call shows up in
 the result instead of on the page image only.
 
 `left_blank_as_sent` names the fields whose value was sent empty, so a box
-the model left blank is not taken for a write that failed.
+the model left blank is not taken for a write that failed. Those fields are
+not repeated in `still_empty`. Sending an empty value for a field that holds
+one empties it: the stored value and its drawing are both removed.
+
+`replaced_values` gives, for each text or choice field that held a different
+value before the fill, the value that was there.
+
+`filler_values` names the text fields that were filled with "None", "N/A" or
+the like, and `next` tells the model to empty them unless the user asked for
+that text.
 
 `pages_touched` lists the pages that were written to. On Open WebUI 0.11.4
 or later those pages, up to `review_pages`, reach the model as images in the
@@ -103,6 +112,11 @@ model.
   or re-saved. The form dictionary is rebuilt.
 - **Checkbox and radio values** are stored as PDF names, so Preview draws the
   selected box. The form's own check mark drawings are kept.
+- **Labels** are read from the printed words only, so a value typed into
+  one box is not taken for the label of the box next to it. A checkbox is
+  labelled by the text after it, or by the caption over it. A box inside
+  a table that has no text beside it is labelled by its column heading and
+  row ("Self, row 2").
 - **Text that does not fit its box** is drawn at a smaller font size for that
   value only. The form's font setting is left as it was.
 - **Values stored but never drawn** are drawn on every fill, so they show in
