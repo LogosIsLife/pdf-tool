@@ -1,12 +1,23 @@
 """
 title: PDF Form Filler (PyMuPDF)
 author: darlene
-version: 1.3.0
+version: 1.4.0
 license: AGPL-3.0
 description: Inspect and fill the form fields (AcroForm) of a PDF attached to the chat, return the filled PDF as a downloadable attachment, and show a page to the model as an image.
 """
 
 # Paste this whole file into Open WebUI: Admin > Tools > + > paste > Save.
+# Changes in 1.4.0 (after the CME forms chat of 2026-10-01):
+#  - A field drawn in several differently labelled boxes (one /T with four
+#    widgets: Topic, Date, Name, Date Signed) is split so each box is its own
+#    field; before, one value showed in every box and the form was unfillable.
+#  - Wrapped text no longer runs past the bottom of its box, text is never
+#    drawn below min_font_size, and a value that still does not fit is
+#    reported as cut off so the model shortens it instead of calling it done.
+#  - flatten_form flattens a filled copy without resending its values.
+#  - The listing tells the model that a printed line with no field here
+#    cannot be filled, so it says so instead of describing it as done.
+#
 # PyMuPDF must be provided by the open-webui systemd unit (--with pymupdf); a
 # `requirements:` line is deliberately absent because that environment has
 # no pip and the install step would fail.
@@ -33,7 +44,6 @@ from datetime import date
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
-
 
 # --------------------------------------------------------------------------
 # Pure PyMuPDF helpers (no Open WebUI imports, so they can be tested standalone)
@@ -183,6 +193,22 @@ def _inherited(doc, xref: int, key: str) -> tuple[str, str]:
         node = _refs(pv)[0] if pk == "xref" and _refs(pv) else 0
         hops += 1
     return ("null", "null")
+
+
+def _delete_key(doc, xref: int, key: str) -> None:
+    """Remove a key from a dictionary object (xref_set_key leaves a literal null behind)."""
+    try:
+        body = doc.xref_object(xref, compressed=True)
+    except Exception:
+        return
+    new = re.sub(
+        r"/" + re.escape(key) + r"(?=[\s/\[<(])\s*(?:\d+\s+0\s+R|null)",
+        "",
+        body,
+        count=1,
+    )
+    if new != body:
+        doc.update_object(xref, new)
 
 
 def _rect_of(doc, xref: int):
@@ -369,12 +395,32 @@ def _relink_detached_widgets(doc) -> int:
     return relinked
 
 
-def _prepared(source):
-    """Open a PDF with its form structure repaired and ready for the widget API."""
+def _prepared(source, info: Optional[dict] = None):
+    """Open a PDF with its form structure repaired and ready for the widget API.
+
+    Pass a dict as `info` to learn what was changed: "relinked" (boxes put
+    back into the field tree) and "split" ({old name: [new names]} of fields
+    that were drawn in several differently labelled boxes).
+    """
     doc = _open_document(source)
     try:
-        if _relink_detached_widgets(doc):
+        relinked = _relink_detached_widgets(doc)
+        if info is not None:
+            info["relinked"] = relinked
+        if relinked:
             # Reload so PyMuPDF rebuilds its view of the form from the repaired tree.
+            data = doc.tobytes(garbage=0)
+            doc.close()
+            doc = _open_document(data)
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    try:
+        split = _split_shared_fields(doc, _collect(doc))
+        if info is not None:
+            info["split"] = split
+        if split:
             data = doc.tobytes(garbage=0)
             doc.close()
             doc = _open_document(data)
@@ -612,23 +658,124 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def _text_label(b: dict) -> str:
+    """The printed label of a text or choice box: left of it, under it, right of it, or its table column."""
+    return (
+        b.get("label_left")
+        or b.get("label_below")
+        or b.get("label_right")
+        or b.get("label_table")
+        or ""
+    )
+
+
+_INHERITABLE = ("FT", "Ff", "DA", "Q", "MaxLen", "TU", "V", "DV", "Opt", "DR")
+
+
+def _top_ancestor(doc, xref: int) -> int:
+    top, hops = xref, 0
+    while hops < 16:
+        pk, pv = _get(doc, top, "Parent")
+        if pk != "xref" or not _refs(pv):
+            break
+        top = _refs(pv)[0]
+        hops += 1
+    return top
+
+
+def _split_shared_fields(
+    doc, boxes: dict[str, list[dict[str, Any]]]
+) -> dict[str, list[str]]:
+    """Give each box of a mislabelled shared field its own field.
+
+    A form made by drawing one field in several places shows one value in all
+    of them. When those places carry different printed labels (Topic, Date,
+    Name, Date Signed) that is a defect of the form, not a mirror: each box
+    was meant to hold its own value. Each such box becomes a field named
+    "<name>_<n>", numbered top to bottom, carrying what it inherited from its
+    parent. Boxes that share a label (a name repeated on every page) are left
+    shared. Returns {old name: [new names]}; the document must be saved and
+    reopened for PyMuPDF to see the change.
+    """
+    mu = _mu()
+    done: dict[str, list[str]] = {}
+    todo = []
+    for name, group in boxes.items():
+        if group[0]["kind"] not in ("text", "choice") or len(group) < 2:
+            continue
+        labels = {_text_label(b) for b in group if _text_label(b)}
+        if len(labels) < 2:
+            continue
+        todo.append((name, group))
+    if not todo:
+        return done
+    form_xref, prefix = _form_location(doc, create=True)
+    fields, where = _read_array(doc, form_xref, prefix + "Fields")
+    if fields is None:
+        doc.xref_set_key(form_xref, prefix + "Fields", "[]")
+        fields, where = [], ("key", form_xref, prefix + "Fields")
+    for name, group in todo:
+        ordered = sorted(
+            group,
+            key=lambda b: (
+                b["page"],
+                -(_rect_of(doc, b["xref"]) or (0, 0, 0, 0))[3],
+                (_rect_of(doc, b["xref"]) or (0, 0, 0, 0))[0],
+            ),
+        )
+        new_names: list[str] = []
+        for i, b in enumerate(ordered, 1):
+            wx = b["xref"]
+            new_name = f"{name}_{i}"
+            # Keep what the box inherited before it is cut loose from its parent.
+            inherited = {}
+            for key in _INHERITABLE:
+                kind, value = _inherited(doc, wx, key)
+                if kind != "null" and _get(doc, wx, key)[0] == "null":
+                    inherited[key] = (kind, value)
+            pk, pv = _get(doc, wx, "Parent")
+            if pk == "xref" and _refs(pv):
+                parent = _refs(pv)[0]
+                kids, kids_where = _read_array(doc, parent, "Kids")
+                if kids is not None and wx in kids:
+                    kids.remove(wx)
+                    _write_array(doc, kids_where, kids)
+                _delete_key(doc, wx, "Parent")
+            for key, (kind, value) in inherited.items():
+                doc.xref_set_key(
+                    wx, key, mu.get_pdf_str(value) if kind == "string" else value
+                )
+            doc.xref_set_key(wx, "T", mu.get_pdf_str(new_name))
+            if wx not in fields:
+                fields.append(wx)
+            new_names.append(new_name)
+        done[name] = new_names
+    # A parent left without boxes is dropped from the form's field list.
+    live = {_top_ancestor(doc, wx) for _, wx in _page_widget_xrefs(doc)}
+
+    def has_boxes(x: int) -> bool:
+        if x in live:
+            return True
+        kids, _ = _read_array(doc, x, "Kids")
+        return any(has_boxes(k) for k in kids or [])
+
+    _write_array(doc, where, [x for x in fields if has_boxes(x)])
+    return done
+
+
 def inspect_pdf_fields(path: str) -> dict[str, Any]:
     """Return the form fields of a PDF: name, type, printed label, value, options."""
-    doc = _prepared(path)
+    prep: dict[str, Any] = {}
+    doc = _prepared(path, prep)
     try:
         boxes = _collect(doc)
         pages = doc.page_count
     finally:
         doc.close()
+    split: dict[str, list[str]] = prep.get("split") or {}
+    split_from = {new: old for old, news in split.items() for new in news}
 
-    def _label(b):
-        return (
-            b.get("label_left")
-            or b.get("label_below")
-            or b.get("label_right")
-            or b.get("label_table")
-            or ""
-        )
+    _label = _text_label
 
     def _box_label(b):
         # A checkbox or radio square: its text follows it; "A." before it is only a marker.
@@ -700,8 +847,10 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
                 entry["value"] = str(value)
             if kind == "choice":
                 entry["options"] = [shown for _, shown in group[0].get("choices", [])]
+            if name in split_from:
+                entry["split_from"] = split_from[name]
         out.append(entry)
-    return {
+    result: dict[str, Any] = {
         "pages": pages,
         "field_count": len(out),
         "fields": out,
@@ -709,9 +858,18 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
             "Use 'label' (the text printed on the form next to or under the box) and 'tooltip' (the form's own "
             "description of the box) to decide what each field is for; fill by 'name', copied exactly. "
             "Leave out a field the form does not require or that does not apply; never write filler such as "
-            "'None' or 'N/A' into it."
+            "'None' or 'N/A' into it. A line, box or checkbox printed on the form that has no entry in this "
+            "list cannot be filled by this tool: if the request covers one, tell the user plainly that the "
+            "form has no field for it and that it must be completed by hand; never describe it as done."
         ),
     }
+    if split:
+        result["split_fields"] = split
+        result["note"] += (
+            " The form drew one field in several differently labelled boxes; each box is now its own field "
+            "(see split_fields and split_from). Fill each by its new name with the value its label calls for."
+        )
+    return result
 
 
 # ---- page images -------------------------------------------------------------
@@ -969,60 +1127,82 @@ def _normalize_values(
     return rejected
 
 
-def _fitted_size(widget, value: str) -> Optional[float]:
-    """A font size at which the value fits its box, or None when no change is needed.
+def _fitted_size(
+    widget, value: str, floor: float = 6.0
+) -> tuple[Optional[float], bool]:
+    """(font size to draw at, whether the value then fits its box).
 
-    Some forms declare a font taller than the box (LibreOffice: 11 pt text in an
-    8 pt box) or receive a value longer than the box is wide. Drawn at the
-    declared size the text is cut off. An explicit size is computed because
-    automatic sizing turns negative, and mirrors the text, in very small boxes.
+    The size is None when the form's own size is fine. Some forms declare a
+    font taller than the box (LibreOffice: 11 pt text in an 8 pt box) or
+    receive a value longer than the box is wide; drawn at the declared size
+    the text is cut off, so a smaller size is found. Text is never drawn
+    below `floor` points, since smaller print cannot be read: a value that
+    needs less is drawn at the floor and reported as not fitting, for the
+    caller to shorten. An explicit size is always computed because automatic
+    sizing turns negative, and mirrors the text, in very small boxes.
     """
-    import math
-
     mu = _mu()
     try:
         declared = float(widget.text_fontsize or 0)
     except Exception:
-        return None
+        return None, True
     width, height = abs(widget.rect.width), abs(widget.rect.height)
     if width <= 0 or height <= 0:
-        return None
-    lines = value.splitlines() or [""]
-    longest = max(len(line) for line in lines)
+        return None, True
+    lines = value.replace("\r\n", "\n").replace("\r", "\n").split("\n") or [""]
     multiline = bool(int(widget.field_flags or 0) & mu.PDF_TX_FIELD_IS_MULTILINE)
-    floor = 2.0
+    inner = max(1.0, width - 4)  # PyMuPDF keeps a 2 pt margin on each side
+    floor = max(2.0, float(floor or 0))
     ceiling = max(floor, height - 1.5)
+
+    def text_width(text: str, size: float) -> float:
+        try:
+            # Helvetica is as wide as any font a form is likely to use.
+            return mu.get_text_length(text, "helv", size)
+        except Exception:
+            return len(text) * size * 0.5
+
+    def line_count(size: float) -> int:
+        """How many lines the value takes once each line is wrapped at the box edge."""
+        total = 0
+        for line in lines:
+            words = line.split() or [""]
+            used, count = 0.0, 1
+            for word in words:
+                w = text_width(word, size)
+                gap = text_width(" ", size) if used else 0.0
+                if used and used + gap + w > inner:
+                    count += 1
+                    used = w
+                else:
+                    used += gap + w
+            total += count
+        return total
 
     def fits(size: float) -> bool:
         if size > ceiling:
             return False
-        per_line = max(1.0, (width - 4) / (size * 0.5))
         if not multiline:
-            try:
-                # Helvetica is as wide as any font a form is likely to use.
-                return (
-                    max(mu.get_text_length(line, "helv", size) for line in lines)
-                    <= width - 4
-                )
-            except Exception:
-                return longest <= per_line
-        needed = sum(max(1, math.ceil(len(line) / per_line)) for line in lines)
-        if needed == 1:
-            return True  # one line: only the height limit above applies
-        return needed * size * 1.15 <= max(height - 2, size)
+            return max(text_width(line, size) for line in lines) <= inner
+        n = line_count(size)
+        # Measured on PyMuPDF's drawings: 2 pt above the first line, 1.12 em
+        # from one baseline to the next, 1.38 em for a line's full height.
+        return 2 + size * (1.12 * (n - 1) + 1.38) <= height
 
     if declared > 0:
         if fits(declared):
-            return None
+            return None, True
         size = declared
     else:
         # Automatic: safe in a normal box, not in a tiny one.
         if height >= 8:
-            return None
+            return None, True
         size = ceiling
+    size = min(size, ceiling)
     while size > floor and not fits(size):
         size -= 0.5
-    return round(max(floor, size), 2)
+    size = round(max(floor, size), 2)
+    return size, fits(size)
 
 
 def _clear_value(doc, widget) -> None:
@@ -1050,29 +1230,29 @@ def _clear_value(doc, widget) -> None:
         doc.update_stream(_refs(value)[0], b"/Tx BMC\nEMC\n")
 
 
-def _draw_value(doc, widget, value) -> None:
-    """Set a text or choice value and draw it, keeping the form's own font setting."""
+def _draw_value(doc, widget, value, floor: float = 6.0) -> dict[str, Any]:
+    """Set a text or choice value and draw it, keeping the form's own font setting.
+
+    Returns {"font_size": the smaller size used, or None; "cut_off": whether
+    the value still does not fit the box at that size}.
+    """
     mu = _mu()
+    out: dict[str, Any] = {"font_size": None, "cut_off": False}
     if value in (None, "", []):
         _clear_value(doc, widget)
-        return
+        return out
     size = None
     if widget.field_type == mu.PDF_WIDGET_TYPE_TEXT and value:
-        size = _fitted_size(widget, str(value))
-    before = _get(doc, widget.xref, "DA")
+        size, ok = _fitted_size(widget, str(value), floor)
+        out = {"font_size": size, "cut_off": not ok}
     if size is not None:
+        # The size stays in the box's own DA string. An unflattened copy asks
+        # viewers to redraw the boxes (NeedAppearances), and a viewer that
+        # does so at the form's declared size would cut the value off again.
         widget.text_fontsize = size
     widget.field_value = value
     widget.update()
-    if size is not None:
-        # The smaller size was for this drawing only.
-        try:
-            if before[0] == "string":
-                doc.xref_set_key(widget.xref, "DA", mu.get_pdf_str(before[1]))
-            elif before[0] == "null":
-                doc.xref_set_key(widget.xref, "DA", "null")
-        except Exception:
-            pass
+    return out
 
 
 def _own_drawing(doc, widget) -> Optional[str]:
@@ -1352,17 +1532,20 @@ def fill_pdf_fields(
     flatten: bool = False,
     rejected: Optional[list] = None,
     report: Optional[dict] = None,
+    min_font_size: float = 6.0,
 ) -> tuple[bytes, list[str]]:
     """Fill fields and return (pdf_bytes, unknown_field_names).
 
-    Pass a list as `rejected` to receive values that matched none of a field's
-    options; those fields are left as they were. Pass a dict as `report` to
-    receive what was written and whether it reads back: filled, remapped,
-    blank, replaced, filler, ambiguous, did_not_stick, still_empty,
-    pages_touched.
+    `values` may be empty when `flatten` is set: the file is then flattened
+    as it is. Pass a list as `rejected` to receive values that matched none
+    of a field's options; those fields are left as they were. Pass a dict as
+    `report` to receive what was written and whether it reads back: filled,
+    remapped, blank, replaced, filler, ambiguous, did_not_stick, still_empty,
+    pages_touched, shrunk ({name: pt}), cut_off, split_fields.
     """
     mu = _mu()
-    doc = _prepared(path)
+    prep: dict[str, Any] = {}
+    doc = _prepared(path, prep)
     try:
         boxes = _collect(doc)
         if not boxes:
@@ -1370,6 +1553,9 @@ def fill_pdf_fields(
                 "This PDF has no fillable fields (a flat, scanned, or already flattened form), so there is nothing to fill."
             )
         mapped, remapped, unknown, ambiguous = _resolve_names(boxes, values)
+        split: dict[str, list[str]] = prep.get("split") or {}
+        shrunk: dict[str, float] = {}
+        cut_off: set[str] = set()
         clean: dict[str, str] = {}
         for k, v in mapped.items():
             if isinstance(v, bool):
@@ -1399,7 +1585,11 @@ def fill_pdf_fields(
                     state = _on_state(w)
                     _switch_box(doc, w, bool(state and state == value))
                 else:
-                    _draw_value(doc, w, value)
+                    drawn = _draw_value(doc, w, value, min_font_size)
+                    if drawn["font_size"] is not None:
+                        shrunk[w.field_name] = drawn["font_size"]
+                    if drawn["cut_off"]:
+                        cut_off.add(w.field_name)
 
         _fix_button_values(doc, set(clean))
         _refresh_empty_appearances(doc)
@@ -1463,6 +1653,9 @@ def fill_pdf_fields(
                     "pages_touched": sorted(
                         {b["page"] for k in clean for b in boxes[k]}
                     ),
+                    "shrunk": shrunk,
+                    "cut_off": sorted(cut_off),
+                    "split_fields": split,
                 }
             )
         return data, unknown
@@ -1489,6 +1682,14 @@ class Tools:
             description=(
                 "Public URL of this Open WebUI, e.g. https://drcurbside.ai, used to build full download "
                 "links. Leave empty to use the WebUI URL from Admin > Settings > General, or the request host."
+            ),
+        )
+
+        min_font_size: float = Field(
+            default=6.0,
+            description=(
+                "Smallest font size, in points, a value is shrunk to so it fits its box. A value that "
+                "does not fit at this size is drawn cut off and reported, so the model can shorten it."
             ),
         )
 
@@ -1710,11 +1911,15 @@ class Tools:
         that hold no value: fill the ones the request covers. Leave out a
         field the form does not require or that does not apply; never write
         filler such as "None" or "N/A" into it. To empty a field that holds
-        a value, send "" for it. Before telling the user the
-        form is complete, look at every page in pages_touched: either in
-        page_images of this result, or with render_page. If a value is missing
-        on the image, call fill_form again.
-        :param values: JSON object mapping field names to values, e.g. {"Name": "Jane Doe", "Date": "09/16/2026"}. Include every field you want filled in ONE call. For a checkbox use true or false; for a radio group use the option value from list_form_fields (for example "/A").
+        a value, send "" for it. Values in text_cut_off do not fit their
+        boxes even at the smallest readable size: shorten them and call
+        fill_form again. Before telling the user the form is complete, look
+        at every page in pages_touched: either in page_images of this
+        result, or with render_page. If a value is missing on the image,
+        call fill_form again. A line printed on the form that has no field
+        cannot be filled: say so to the user rather than describing it as
+        done. To flatten a copy you already filled, call flatten_form.
+        :param values: JSON object mapping field names to values, e.g. {"Name": "Jane Doe", "Date": "09/16/2026"}. Include every field you want filled in ONE call. For a checkbox use true or false; for a radio group use the option value from list_form_fields (for example "/A"). May be {} only together with flatten=true.
         :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
         :param output_name: File name for the filled copy. Defaults to "<original>-filled.pdf".
         :param flatten: Leave unset. Only set true when the user explicitly asks for a flattened or non-editable PDF.
@@ -1726,49 +1931,77 @@ class Tools:
         try:
             user_id = (__user__ or {}).get("id")
             try:
-                parsed = json.loads(values) if isinstance(values, str) else dict(values)
+                parsed = (
+                    json.loads(values or "{}")
+                    if isinstance(values, str)
+                    else dict(values or {})
+                )
             except json.JSONDecodeError as e:
                 return json.dumps({"error": f"values is not valid JSON: {e}"})
-            if not isinstance(parsed, dict) or not parsed:
-                return json.dumps({"error": "values must be a non-empty JSON object"})
+            do_flatten = _as_bool(flatten, default=self.valves.flatten_by_default)
+            if not isinstance(parsed, dict) or (not parsed and not do_flatten):
+                return json.dumps(
+                    {
+                        "error": "values must be a non-empty JSON object (to flatten a filled copy without "
+                        "changing it, call flatten_form)"
+                    }
+                )
 
             fid, path, orig_name = await self._pick_file(file_id, __files__, user_id)
-            do_flatten = _as_bool(flatten, default=self.valves.flatten_by_default)
             rejected: list = []
             report: dict = {}
             pdf_bytes, unknown = fill_pdf_fields(
-                path, parsed, flatten=do_flatten, rejected=rejected, report=report
+                path,
+                parsed,
+                flatten=do_flatten,
+                rejected=rejected,
+                report=report,
+                min_font_size=float(self.valves.min_font_size or 6.0),
             )
             ambiguous = report.get("ambiguous") or []
             did_not_stick = report.get("did_not_stick") or []
             filled = report.get("filled") or []
+            cut_off = report.get("cut_off") or []
+            split = report.get("split_fields") or {}
 
             problems: dict[str, Any] = {}
             if unknown:
                 problems["ignored_unknown_fields"] = unknown
+                was_split = {n: split[n] for n in unknown if n in split}
+                if was_split:
+                    problems["split_fields"] = was_split
             if ambiguous:
                 problems["ambiguous_fields"] = ambiguous
             if rejected:
                 problems["not_set_invalid_option"] = rejected
             if did_not_stick:
                 problems["did_not_stick"] = did_not_stick
+            if cut_off:
+                sizes = report.get("shrunk") or {}
+                problems["text_cut_off"] = {
+                    name: f"drawn at {sizes.get(name, 'the form')} pt and still cut off; shorten it"
+                    for name in cut_off
+                }
 
-            if not filled:
+            if not filled and not (do_flatten and not parsed):
                 # Nothing was written: an unchanged copy in the chat would pass for a filled form.
+                hint = (
+                    "Nothing was filled and no file was made. Call list_form_fields, then fill_form "
+                    "again with the exact names. Do not ask the user."
+                )
+                if problems.get("split_fields"):
+                    hint = (
+                        "Nothing was filled and no file was made. The fields in split_fields were drawn in "
+                        "several boxes and have been split, one field per box: call list_form_fields to see "
+                        "each new field's label, then fill_form again with the new names. Do not ask the user."
+                    )
                 return json.dumps(
-                    {
-                        "status": "failed",
-                        **problems,
-                        "next": (
-                            "Nothing was filled and no file was made. Call list_form_fields, then fill_form "
-                            "again with the exact names. Do not ask the user."
-                        ),
-                    },
-                    indent=2,
+                    {"status": "failed", **problems, "next": hint}, indent=2
                 )
 
             base = os.path.splitext(os.path.basename(orig_name))[0]
-            out_name = output_name.strip() or f"{base}-filled.pdf"
+            suffix = "-flattened" if do_flatten and not parsed else "-filled"
+            out_name = output_name.strip() or f"{base}{suffix}.pdf"
             if not out_name.lower().endswith(".pdf"):
                 out_name += ".pdf"
 
@@ -1875,10 +2108,22 @@ class Tools:
             unseen = [n for n in pages if f"page_{n}" not in images]
 
             steps = []
-            if problems:
+            if problems.get("split_fields"):
+                steps.append(
+                    "The fields in split_fields were drawn in several boxes and have been split, one field per "
+                    "box. Call list_form_fields to see their labels, then fill_form again with "
+                    f'file_id "{new_id}" and the new names.'
+                )
+            elif {k for k in problems if k != "text_cut_off"}:
                 steps.append(
                     "Some values were NOT written. Call list_form_fields, then fill_form again with "
                     f'file_id "{new_id}", the exact names, and only the fields listed above. Do not ask the user.'
+                )
+            if cut_off:
+                steps.append(
+                    "The values in text_cut_off do not fit their boxes even at the smallest readable size and "
+                    f'are cut off on the page. Shorten them and call fill_form again with file_id "{new_id}" '
+                    "and only those fields. Do not tell the user the form is complete while a value is cut off."
                 )
             if images:
                 steps.append(
@@ -1892,7 +2137,13 @@ class Tools:
                     f'fill_form again with file_id "{new_id}" and "" for those fields to empty them.'
                 )
             still_empty = report.get("still_empty") or {}
-            if still_empty:
+            if still_empty and do_flatten:
+                steps.append(
+                    "The fields in still_empty held no value when the copy was flattened, and a flattened copy "
+                    f'cannot be filled. If the request covers one of them, call fill_form with file_id "{fid}" '
+                    "(the copy before flattening), those fields, and flatten=true. Do not ask the user."
+                )
+            elif still_empty:
                 steps.append(
                     "The fields in still_empty hold no value. If the request covers one of them, call fill_form "
                     f'again with file_id "{new_id}" and only those fields; leave the rest empty. Do not ask the user.'
@@ -1920,6 +2171,11 @@ class Tools:
             )
             if report.get("remapped"):
                 result["remapped_fields"] = report["remapped"]
+            if report.get("shrunk"):
+                # Sizes under about 8 pt are hard to read on paper; the model can shorten such values.
+                result["small_text_pt"] = report["shrunk"]
+            if split:
+                result["split_fields"] = split
             if still_empty:
                 result["still_empty"] = still_empty
             if report.get("blank"):
@@ -1938,3 +2194,33 @@ class Tools:
             return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    async def flatten_form(
+        self,
+        file_id: str = "",
+        output_name: str = "",
+        __user__: Optional[dict] = None,
+        __files__: Optional[list] = None,
+        __event_emitter__=None,
+        __request__=None,
+    ):
+        """
+        Flatten a filled PDF so its values become fixed page content that can
+        no longer be edited, without changing any value. Use it when the user
+        asks for a flattened or non-editable copy of a form that is already
+        filled; pass the file_id that fill_form returned. To fill and flatten
+        in one step, call fill_form with flatten=true instead.
+        :param file_id: Id of the filled PDF to flatten. Leave empty when only one PDF is attached.
+        :param output_name: File name for the flattened copy. Defaults to "<original>-flattened.pdf".
+        :return: A summary with the page images to check and the full download URL of the flattened PDF.
+        """
+        return await self.fill_form(
+            values="{}",
+            file_id=file_id,
+            output_name=output_name,
+            flatten=True,
+            __user__=__user__,
+            __files__=__files__,
+            __event_emitter__=__event_emitter__,
+            __request__=__request__,
+        )
