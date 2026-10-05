@@ -100,7 +100,9 @@ def _open_document(source):
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"This PDF could not be read; the file appears to be damaged ({type(e).__name__}: {e}).")
+        raise ValueError(
+            f"This PDF could not be read; the file appears to be damaged ({type(e).__name__}: {e})."
+        )
 
 
 # ---- low-level object access ------------------------------------------------
@@ -190,7 +192,12 @@ def _rect_of(doc, xref: int):
     nums = [float(n) for n in _NUM.findall(value)]
     if len(nums) != 4:
         return None
-    return (min(nums[0], nums[2]), min(nums[1], nums[3]), max(nums[0], nums[2]), max(nums[1], nums[3]))
+    return (
+        min(nums[0], nums[2]),
+        min(nums[1], nums[3]),
+        max(nums[0], nums[2]),
+        max(nums[1], nums[3]),
+    )
 
 
 def _page_widget_xrefs(doc) -> list[tuple[int, int]]:
@@ -237,7 +244,9 @@ def _relink_detached_widgets(doc) -> int:
     if not page_widgets:
         return 0
     named = [
-        x for x in page_widgets if _get(doc, x, "T")[0] != "null" or _get(doc, x, "Parent")[0] == "xref"
+        x
+        for x in page_widgets
+        if _get(doc, x, "T")[0] != "null" or _get(doc, x, "Parent")[0] == "xref"
     ]
     if not named:
         return 0
@@ -281,7 +290,11 @@ def _relink_detached_widgets(doc) -> int:
     used: set[tuple] = set()
 
     def close(a, b, tol=2.0):
-        return a is not None and b is not None and all(abs(p - q) <= tol for p, q in zip(a, b))
+        return (
+            a is not None
+            and b is not None
+            and all(abs(p - q) <= tol for p, q in zip(a, b))
+        )
 
     relinked = 0
     for wx in page_widgets:
@@ -298,11 +311,13 @@ def _relink_detached_widgets(doc) -> int:
             if ident is None:
                 continue
             cands = [
-                (i, k) for i, k in enumerate(arrays[ident]) if k not in on_page and (ident, i) not in used
+                (i, k)
+                for i, k in enumerate(arrays[ident])
+                if k not in on_page and (ident, i) not in used
             ]
-            match = next((c for c in cands if close(_rect_of(doc, c[1]), wrect)), None) or (
-                cands[0] if cands else None
-            )
+            match = next(
+                (c for c in cands if close(_rect_of(doc, c[1]), wrect)), None
+            ) or (cands[0] if cands else None)
             if match is None:
                 arrays[ident].append(wx)
             else:
@@ -441,7 +456,9 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
     mid = (top + bottom) / 2
     on_line = [w for w in page_words if abs((w[1] + w[3]) / 2 - mid) <= h * 0.6]
     # A label may run up to the box or a little into it ("Sponsor:|___").
-    left = phrases([w for w in on_line if w[2] <= x1 + 3 and w[0] < x1 - 1 and w[0] >= x1 - 300])
+    left = phrases(
+        [w for w in on_line if w[2] <= x1 + 3 and w[0] < x1 - 1 and w[0] >= x1 - 300]
+    )
     right = phrases([w for w in on_line if w[0] >= x2 + 1 and w[0] <= x2 + 300])
     below = phrases(
         [
@@ -452,7 +469,9 @@ def _widget_label(page_words: list, body_h: float, rect) -> dict[str, str]:
             and (w[3] - w[1]) <= body_h * 0.85
         ]
     )
-    over = [w for w in page_words if w[3] <= top + 1 and w[2] >= x1 - 6 and w[0] <= x2 + 6]
+    over = [
+        w for w in page_words if w[3] <= top + 1 and w[2] >= x1 - 6 and w[0] <= x2 + 6
+    ]
     above: list[str] = []
     edge, reach = top, 16.0
     for _ in range(3):
@@ -493,7 +512,10 @@ def _table_labels(page, widgets) -> dict[int, str]:
     out: dict[int, str] = {}
     for table in tables:
         try:
-            names = [_clean_label(str(n or "").replace("/\n", "/")) for n in table.header.names]
+            names = [
+                _clean_label(str(n or "").replace("/\n", "/"))
+                for n in table.header.names
+            ]
             rows = list(table.rows)
             body = rows if table.header.external else rows[1:]
         except Exception:
@@ -506,7 +528,9 @@ def _table_labels(page, widgets) -> dict[int, str]:
                 for w in widgets:
                     r = w.rect
                     if x0 <= (r.x0 + r.x1) / 2 <= x1 and y0 <= (r.y0 + r.y1) / 2 <= y1:
-                        out[w.xref] = names[column] + (f", row {number}" if len(body) > 1 else "")
+                        out[w.xref] = names[column] + (
+                            f", row {number}" if len(body) > 1 else ""
+                        )
     return out
 
 
@@ -517,8 +541,16 @@ def _printed_words(page, widgets) -> list:
     pass for the label of the box next to it.
     """
     mu = _mu()
-    typed = (mu.PDF_WIDGET_TYPE_TEXT, mu.PDF_WIDGET_TYPE_COMBOBOX, mu.PDF_WIDGET_TYPE_LISTBOX)
-    filled = [w.rect for w in widgets if w.field_type in typed and w.field_value not in (None, "", [])]
+    typed = (
+        mu.PDF_WIDGET_TYPE_TEXT,
+        mu.PDF_WIDGET_TYPE_COMBOBOX,
+        mu.PDF_WIDGET_TYPE_LISTBOX,
+    )
+    filled = [
+        w.rect
+        for w in widgets
+        if w.field_type in typed and w.field_value not in (None, "", [])
+    ]
     out = []
     for w in page.get_text("words"):
         if set(w[4]) <= set("_.-"):
@@ -561,7 +593,9 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
                 info.update(_widget_label(words, body_h, w.rect))
             except Exception:
                 pass
-            if not any(info.get(k) for k in ("label_left", "label_below", "label_right")):
+            if not any(
+                info.get(k) for k in ("label_left", "label_below", "label_right")
+            ):
                 if in_table is None:
                     in_table = _table_labels(page, widgets)
                 if in_table.get(w.xref):
@@ -588,7 +622,13 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
         doc.close()
 
     def _label(b):
-        return b.get("label_left") or b.get("label_below") or b.get("label_right") or b.get("label_table") or ""
+        return (
+            b.get("label_left")
+            or b.get("label_below")
+            or b.get("label_right")
+            or b.get("label_table")
+            or ""
+        )
 
     def _box_label(b):
         # A checkbox or radio square: its text follows it; "A." before it is only a marker.
@@ -615,7 +655,12 @@ def inspect_pdf_fields(path: str) -> dict[str, Any]:
                 if b.get("on_value") and b["on_value"] not in states:
                     states.append(b["on_value"])
             current = next(
-                (b["on_value"] for b in group if b.get("on_value") and "/" + str(b["value"]).lstrip("/") == b["on_value"]),
+                (
+                    b["on_value"]
+                    for b in group
+                    if b.get("on_value")
+                    and "/" + str(b["value"]).lstrip("/") == b["on_value"]
+                ),
                 "/Off",
             )
             if len(group) == 1:
@@ -685,10 +730,18 @@ def _show_stored_drawings(doc) -> None:
         if form is None or _get(doc, form[0], form[1] + "NeedAppearances")[1] != "true":
             return
         mu = _mu()
-        drawn = (mu.PDF_WIDGET_TYPE_TEXT, mu.PDF_WIDGET_TYPE_COMBOBOX, mu.PDF_WIDGET_TYPE_LISTBOX)
+        drawn = (
+            mu.PDF_WIDGET_TYPE_TEXT,
+            mu.PDF_WIDGET_TYPE_COMBOBOX,
+            mu.PDF_WIDGET_TYPE_LISTBOX,
+        )
         for page in doc:
             for w in page.widgets():
-                if w.field_type in drawn and w.field_value not in (None, "", []) and not _has_drawn_text(doc, w.xref):
+                if (
+                    w.field_type in drawn
+                    and w.field_value not in (None, "", [])
+                    and not _has_drawn_text(doc, w.xref)
+                ):
                     return
         doc.xref_set_key(form[0], form[1] + "NeedAppearances", "false")
     except Exception:
@@ -717,7 +770,9 @@ def render_pdf_page(
         except Exception:
             raise ValueError(f"page must be a whole number between 1 and {count}.")
         if number < 1 or number > count:
-            raise ValueError(f"This PDF has {count} page(s); page {number} does not exist.")
+            raise ValueError(
+                f"This PDF has {count} page(s); page {number} does not exist."
+            )
         _show_stored_drawings(doc)
         pg = doc[number - 1]
         dpi = max(40, min(int(dpi or 110), 300))
@@ -811,12 +866,20 @@ def _resolve_names(boxes: dict[str, list[dict[str, Any]]], values: dict[str, Any
                 {
                     "sent": k,
                     "reason": "fits several fields; use one exact name",
-                    "candidates": [{"name": n, "page": boxes[n][0]["page"]} for n in found],
+                    "candidates": [
+                        {"name": n, "page": boxes[n][0]["page"]} for n in found
+                    ],
                 }
             )
         elif found[0] in mapped:
             ambiguous.append(
-                {"sent": k, "reason": "another name in the same call already filled this field", "candidates": [{"name": found[0], "page": boxes[found[0]][0]["page"]}]}
+                {
+                    "sent": k,
+                    "reason": "another name in the same call already filled this field",
+                    "candidates": [
+                        {"name": found[0], "page": boxes[found[0]][0]["page"]}
+                    ],
+                }
             )
         else:
             mapped[found[0]] = v
@@ -824,7 +887,9 @@ def _resolve_names(boxes: dict[str, list[dict[str, Any]]], values: dict[str, Any
     return mapped, remapped, unknown, ambiguous
 
 
-def _normalize_values(boxes: dict[str, list[dict[str, Any]]], clean: dict[str, str]) -> list[dict[str, Any]]:
+def _normalize_values(
+    boxes: dict[str, list[dict[str, Any]]], clean: dict[str, str]
+) -> list[dict[str, Any]]:
     """Turn loose answers into the exact option the form uses.
 
     Checkbox and radio: accepts the option with or without its leading slash,
@@ -848,10 +913,18 @@ def _normalize_values(boxes: dict[str, list[dict[str, Any]]], clean: dict[str, s
                 if b.get("on_value") and b["on_value"] not in options:
                     options.append(b["on_value"])
             if not options:
-                rejected.append({"field": name, "value": raw, "reason": "this box has no checked state"})
+                rejected.append(
+                    {
+                        "field": name,
+                        "value": raw,
+                        "reason": "this box has no checked state",
+                    }
+                )
                 del clean[name]
                 continue
-            match = next((o for o in options if o.lstrip("/").strip().lower() == bare), None)
+            match = next(
+                (o for o in options if o.lstrip("/").strip().lower() == bare), None
+            )
             if match is not None:
                 clean[name] = match
             elif bare in _FALSE_WORDS:
@@ -859,21 +932,39 @@ def _normalize_values(boxes: dict[str, list[dict[str, Any]]], clean: dict[str, s
             elif bare in _TRUE_WORDS and len(options) == 1:
                 clean[name] = options[0]
             else:
-                rejected.append({"field": name, "value": raw, "valid_options": options + ["/Off"]})
+                rejected.append(
+                    {"field": name, "value": raw, "valid_options": options + ["/Off"]}
+                )
                 del clean[name]
         elif kind == "choice":
             choices = group[0].get("choices") or []
             match = next(
-                (shown for stored, shown in choices if raw.lower() in (shown.strip().lower(), stored.strip().lower())),
+                (
+                    shown
+                    for stored, shown in choices
+                    if raw.lower() in (shown.strip().lower(), stored.strip().lower())
+                ),
                 None,
             )
             if match is not None:
                 clean[name] = match
             elif choices and raw:
-                rejected.append({"field": name, "value": raw, "valid_options": [shown for _, shown in choices]})
+                rejected.append(
+                    {
+                        "field": name,
+                        "value": raw,
+                        "valid_options": [shown for _, shown in choices],
+                    }
+                )
                 del clean[name]
         elif kind in ("signature", "push_button", "unknown"):
-            rejected.append({"field": name, "value": raw, "reason": f"a {kind.replace('_', ' ')} cannot be filled with text"})
+            rejected.append(
+                {
+                    "field": name,
+                    "value": raw,
+                    "reason": f"a {kind.replace('_', ' ')} cannot be filled with text",
+                }
+            )
             del clean[name]
     return rejected
 
@@ -909,7 +1000,10 @@ def _fitted_size(widget, value: str) -> Optional[float]:
         if not multiline:
             try:
                 # Helvetica is as wide as any font a form is likely to use.
-                return max(mu.get_text_length(line, "helv", size) for line in lines) <= width - 4
+                return (
+                    max(mu.get_text_length(line, "helv", size) for line in lines)
+                    <= width - 4
+                )
             except Exception:
                 return longest <= per_line
         needed = sum(max(1, math.ceil(len(line) / per_line)) for line in lines)
@@ -946,7 +1040,9 @@ def _clear_value(doc, widget) -> None:
     for xref in {holder, widget.xref}:
         for key in ("V", "RV", "I"):
             if _get(doc, xref, key)[0] != "null":
-                doc.xref_set_key(xref, key, "()" if key == "V" and xref == holder else "null")
+                doc.xref_set_key(
+                    xref, key, "()" if key == "V" and xref == holder else "null"
+                )
     if _get(doc, holder, "V")[0] == "null":
         doc.xref_set_key(holder, "V", "()")
     kind, value = _get(doc, widget.xref, "AP/N")
@@ -1022,7 +1118,10 @@ def _switch_box(doc, widget, on: bool) -> None:
     doc.xref_set_key(widget.xref, "AS", state)
     # A box that is its own field carries the value itself; a box inside a
     # group leaves the value to the group (see _fix_button_values).
-    if _get(doc, widget.xref, "T")[0] != "null" or _get(doc, widget.xref, "Parent")[0] != "xref":
+    if (
+        _get(doc, widget.xref, "T")[0] != "null"
+        or _get(doc, widget.xref, "Parent")[0] != "xref"
+    ):
         doc.xref_set_key(widget.xref, "V", state)
     elif _get(doc, widget.xref, "V")[0] != "null":
         doc.xref_set_key(widget.xref, "V", state)
@@ -1062,7 +1161,9 @@ def _fix_button_values(doc, touched: set[str]) -> int:
         kind, value = _get(doc, holder, "V")
         states = [_get(doc, k, "AS") for k in kids]
         on = next((v for t, v in states if t == "name" and v != "/Off"), None)
-        if kind == "name" and (on is None or _decode_name(value) == _decode_name(on) or holder in kids):
+        if kind == "name" and (
+            on is None or _decode_name(value) == _decode_name(on) or holder in kids
+        ):
             continue
         if kind == "null" and on is None:
             continue
@@ -1096,7 +1197,11 @@ def _refresh_empty_appearances(doc) -> int:
     for page in doc:
         for w in page.widgets():
             try:
-                if w.field_type not in (mu.PDF_WIDGET_TYPE_TEXT, mu.PDF_WIDGET_TYPE_COMBOBOX, mu.PDF_WIDGET_TYPE_LISTBOX):
+                if w.field_type not in (
+                    mu.PDF_WIDGET_TYPE_TEXT,
+                    mu.PDF_WIDGET_TYPE_COMBOBOX,
+                    mu.PDF_WIDGET_TYPE_LISTBOX,
+                ):
                     continue
                 if w.field_value in (None, "", []):
                     continue
@@ -1121,7 +1226,10 @@ def _drop_stacked_duplicates(doc) -> int:
         extra = []
         for w in page.widgets():
             r = w.rect
-            if any(n == w.field_name and all(abs(a - b) <= 3 for a, b in zip(k, r)) for n, k in kept):
+            if any(
+                n == w.field_name and all(abs(a - b) <= 3 for a, b in zip(k, r))
+                for n, k in kept
+            ):
                 extra.append(w)
             else:
                 kept.append((w.field_name, tuple(r)))
@@ -1134,7 +1242,9 @@ def _drop_stacked_duplicates(doc) -> int:
     return removed
 
 
-def _read_back(data: bytes, wanted: dict[str, str], empty: Optional[dict] = None) -> list[dict[str, Any]]:
+def _read_back(
+    data: bytes, wanted: dict[str, str], empty: Optional[dict] = None
+) -> list[dict[str, Any]]:
     """Open the written file again and list every value that is not there.
 
     A text value counts only when it is stored and drawn: a page image shows
@@ -1145,7 +1255,12 @@ def _read_back(data: bytes, wanted: dict[str, str], empty: Optional[dict] = None
     def text(v) -> str:
         if isinstance(v, (list, tuple)):
             v = ", ".join(str(x) for x in v)
-        return str("" if v is None else v).replace("\r\n", "\n").replace("\r", "\n").strip()
+        return (
+            str("" if v is None else v)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .strip()
+        )
 
     def state(v) -> str:
         return "/" + _decode_name(str(v or "Off")).lstrip("/")
@@ -1155,31 +1270,64 @@ def _read_back(data: bytes, wanted: dict[str, str], empty: Optional[dict] = None
         after = _collect(doc)
         if empty is not None:
             for name, group in after.items():
-                if group[0]["kind"] in ("text", "choice") and not text(group[0]["value"]):
+                if group[0]["kind"] in ("text", "choice") and not text(
+                    group[0]["value"]
+                ):
                     empty.setdefault(f"page {group[0]['page']}", []).append(name)
         missing: list[dict[str, Any]] = []
         for name, want in wanted.items():
             group = after.get(name) or []
             if not group:
-                missing.append({"field": name, "wanted": want, "got": None, "reason": "field not found after writing"})
+                missing.append(
+                    {
+                        "field": name,
+                        "wanted": want,
+                        "got": None,
+                        "reason": "field not found after writing",
+                    }
+                )
                 continue
             kind = group[0]["kind"]
             if kind == "checkbox_or_radio":
                 got = next(
-                    (b["on_value"] for b in group if b.get("on_value") and state(b["value"]) == b["on_value"]),
+                    (
+                        b["on_value"]
+                        for b in group
+                        if b.get("on_value") and state(b["value"]) == b["on_value"]
+                    ),
                     "/Off",
                 )
                 if state(got) != state(want):
-                    missing.append({"field": name, "wanted": want, "got": got, "page": group[0]["page"]})
+                    missing.append(
+                        {
+                            "field": name,
+                            "wanted": want,
+                            "got": got,
+                            "page": group[0]["page"],
+                        }
+                    )
                 continue
             got = text(group[0]["value"])
             accepted = {text(want)}
             if kind == "choice":
-                accepted |= {text(stored) for stored, shown in group[0].get("choices") or [] if text(shown) == text(want)}
+                accepted |= {
+                    text(stored)
+                    for stored, shown in group[0].get("choices") or []
+                    if text(shown) == text(want)
+                }
             if got not in accepted:
-                missing.append({"field": name, "wanted": want, "got": got, "page": group[0]["page"]})
+                missing.append(
+                    {
+                        "field": name,
+                        "wanted": want,
+                        "got": got,
+                        "page": group[0]["page"],
+                    }
+                )
             elif text(want):
-                blank = [b["page"] for b in group if not _has_drawn_text(doc, b["xref"])]
+                blank = [
+                    b["page"] for b in group if not _has_drawn_text(doc, b["xref"])
+                ]
                 if blank:
                     missing.append(
                         {
@@ -1238,7 +1386,13 @@ def fill_pdf_fields(
             widgets = [w for w in page.widgets() if w.field_name in clean]
             # Switch boxes off before switching one on: turning a sibling off
             # afterwards would reset the whole group.
-            widgets.sort(key=lambda w: 1 if (w.field_type in buttons and _on_state(w) == clean[w.field_name]) else 0)
+            widgets.sort(
+                key=lambda w: (
+                    1
+                    if (w.field_type in buttons and _on_state(w) == clean[w.field_name])
+                    else 0
+                )
+            )
             for w in widgets:
                 value = clean[w.field_name]
                 if w.field_type in buttons:
@@ -1267,28 +1421,48 @@ def fill_pdf_fields(
                 did_not_stick = _read_back(check, clean, empty)
             except Exception as e:
                 did_not_stick = [
-                    {"field": k, "wanted": v, "got": None, "reason": f"could not be read back ({type(e).__name__})"}
+                    {
+                        "field": k,
+                        "wanted": v,
+                        "got": None,
+                        "reason": f"could not be read back ({type(e).__name__})",
+                    }
                     for k, v in clean.items()
                 ]
             failed = {d["field"] for d in did_not_stick}
-            typed = [k for k in clean if k not in failed and boxes[k][0]["kind"] in ("text", "choice")]
+            typed = [
+                k
+                for k in clean
+                if k not in failed and boxes[k][0]["kind"] in ("text", "choice")
+            ]
             blank = [k for k in typed if not clean[k].strip()]
             # A box left blank on purpose is not one that was forgotten.
-            empty = {p: [n for n in names if n not in blank] for p, names in empty.items()}
+            empty = {
+                p: [n for n in names if n not in blank] for p, names in empty.items()
+            }
             empty = {p: names for p, names in empty.items() if names}
             report.update(
                 {
                     "filled": [k for k in clean if k not in failed],
                     "blank": blank,
                     "replaced": {
-                        k: had[k] for k in typed if had[k] and had[k] != clean[k].strip()
+                        k: had[k]
+                        for k in typed
+                        if had[k] and had[k] != clean[k].strip()
                     },
-                    "filler": [k for k in typed if boxes[k][0]["kind"] == "text" and _key_norm(clean[k]) in _FILLER],
+                    "filler": [
+                        k
+                        for k in typed
+                        if boxes[k][0]["kind"] == "text"
+                        and _key_norm(clean[k]) in _FILLER
+                    ],
                     "remapped": remapped,
                     "ambiguous": ambiguous,
                     "did_not_stick": did_not_stick,
                     "still_empty": empty,
-                    "pages_touched": sorted({b["page"] for k in clean for b in boxes[k]}),
+                    "pages_touched": sorted(
+                        {b["page"] for k in clean for b in boxes[k]}
+                    ),
                 }
             )
         return data, unknown
@@ -1347,9 +1521,13 @@ class Tools:
             if not isinstance(f, dict):
                 continue
             name = f.get("name") or (f.get("file") or {}).get("filename") or ""
-            ctype = f.get("content_type") or (f.get("file") or {}).get("meta", {}).get("content_type", "")
+            ctype = f.get("content_type") or (f.get("file") or {}).get("meta", {}).get(
+                "content_type", ""
+            )
             if name.lower().endswith(".pdf") or ctype == "application/pdf":
-                pdfs.append({"id": f.get("id") or (f.get("file") or {}).get("id"), "name": name})
+                pdfs.append(
+                    {"id": f.get("id") or (f.get("file") or {}).get("id"), "name": name}
+                )
         return pdfs
 
     async def _resolve_path(self, file_id: str, user_id: str) -> tuple[str, str]:
@@ -1366,7 +1544,9 @@ class Tools:
             raise ValueError(f"File missing on disk: {path}")
         return path, rec.filename
 
-    async def _pick_file(self, file_id: str, files: Optional[list], user_id: str) -> tuple[str, str, str]:
+    async def _pick_file(
+        self, file_id: str, files: Optional[list], user_id: str
+    ) -> tuple[str, str, str]:
         if file_id:
             path, name = await self._resolve_path(file_id, user_id)
             return file_id, path, name
@@ -1411,9 +1591,13 @@ class Tools:
         :return: JSON with the file name and its fields (name, type, current value, options).
         """
         try:
-            fid, path, name = await self._pick_file(file_id, __files__, (__user__ or {}).get("id"))
+            fid, path, name = await self._pick_file(
+                file_id, __files__, (__user__ or {}).get("id")
+            )
             info = inspect_pdf_fields(path)
-            info.update({"file_id": fid, "file_name": name, "today": date.today().isoformat()})
+            info.update(
+                {"file_id": fid, "file_name": name, "today": date.today().isoformat()}
+            )
             if info["field_count"] == 0:
                 info["note"] = (
                     "This PDF has no fillable fields (flat or scanned form). "
@@ -1464,7 +1648,9 @@ class Tools:
                 image_name = f"{base}-page{details['page']}.{ext}"
                 new_id = str(uuid.uuid4())
                 _, stored_path = Storage.upload_file(
-                    io.BytesIO(data), f"{new_id}_{image_name}", {"OpenWebUI-User-Id": user_id or ""}
+                    io.BytesIO(data),
+                    f"{new_id}_{image_name}",
+                    {"OpenWebUI-User-Id": user_id or ""},
                 )
                 await Files.insert_new_file(
                     user_id,
@@ -1473,14 +1659,26 @@ class Tools:
                         filename=image_name,
                         path=stored_path,
                         data={},
-                        meta={"name": image_name, "content_type": mime, "size": len(data), "source_file_id": fid},
+                        meta={
+                            "name": image_name,
+                            "content_type": mime,
+                            "size": len(data),
+                            "source_file_id": fid,
+                        },
                     ),
                 )
                 if __event_emitter__:
                     await __event_emitter__(
                         {
                             "type": "files",
-                            "data": {"files": [{"type": "image", "url": f"/api/v1/files/{new_id}/content"}]},
+                            "data": {
+                                "files": [
+                                    {
+                                        "type": "image",
+                                        "url": f"/api/v1/files/{new_id}/content",
+                                    }
+                                ]
+                            },
                         }
                     )
             except Exception:
@@ -1538,7 +1736,9 @@ class Tools:
             do_flatten = _as_bool(flatten, default=self.valves.flatten_by_default)
             rejected: list = []
             report: dict = {}
-            pdf_bytes, unknown = fill_pdf_fields(path, parsed, flatten=do_flatten, rejected=rejected, report=report)
+            pdf_bytes, unknown = fill_pdf_fields(
+                path, parsed, flatten=do_flatten, rejected=rejected, report=report
+            )
             ambiguous = report.get("ambiguous") or []
             did_not_stick = report.get("did_not_stick") or []
             filled = report.get("filled") or []
@@ -1574,7 +1774,9 @@ class Tools:
 
             new_id = str(uuid.uuid4())
             _, stored_path = Storage.upload_file(
-                io.BytesIO(pdf_bytes), f"{new_id}_{out_name}", {"OpenWebUI-User-Id": user_id or ""}
+                io.BytesIO(pdf_bytes),
+                f"{new_id}_{out_name}",
+                {"OpenWebUI-User-Id": user_id or ""},
             )
             rec = await Files.insert_new_file(
                 user_id,
@@ -1595,7 +1797,11 @@ class Tools:
             base = (self.valves.base_url or "").strip().rstrip("/")
             if not base and __request__ is not None:
                 try:
-                    base = (str(getattr(__request__.app.state.config, "WEBUI_URL", "") or "")).rstrip("/")
+                    base = (
+                        str(
+                            getattr(__request__.app.state.config, "WEBUI_URL", "") or ""
+                        )
+                    ).rstrip("/")
                 except Exception:
                     base = ""
                 if not base or base.startswith("http://localhost"):
@@ -1612,11 +1818,19 @@ class Tools:
                 try:
                     from open_webui.internal.db import get_async_db_context
                     from open_webui.models.users import Users
-                    from open_webui.routers.retrieval import ProcessFileForm, process_file
+                    from open_webui.routers.retrieval import (
+                        ProcessFileForm,
+                        process_file,
+                    )
 
                     user_obj = await Users.get_user_by_id(user_id)
                     async with get_async_db_context() as db:
-                        await process_file(__request__, ProcessFileForm(file_id=new_id), user=user_obj, db=db)
+                        await process_file(
+                            __request__,
+                            ProcessFileForm(file_id=new_id),
+                            user=user_obj,
+                            db=db,
+                        )
                     indexed = True
                 except Exception:
                     indexed = False
@@ -1652,7 +1866,10 @@ class Tools:
                             dpi=self.valves.render_dpi,
                             max_kb=self.valves.render_max_kb,
                         )
-                        images[f"page_{number}"] = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+                        images[f"page_{number}"] = (
+                            f"data:{mime};base64,"
+                            + base64.b64encode(data).decode("ascii")
+                        )
                     except Exception:
                         continue
             unseen = [n for n in pages if f"page_{n}" not in images]
