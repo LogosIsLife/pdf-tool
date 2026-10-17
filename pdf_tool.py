@@ -642,6 +642,7 @@ def _collect(doc) -> dict[str, list[dict[str, Any]]]:
                 "kind": _kind(w),
                 "value": w.field_value,
                 "xref": w.xref,
+                "rect": tuple(w.rect),
             }
             try:
                 info.update(_widget_label(words, body_h, w.rect))
@@ -967,6 +968,100 @@ def render_pdf_page(
             "format": mime.split("/")[1],
         }
         return data, mime, details
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _as_rect(value):
+    """A Rect from a Rect, a list of four numbers, or that list as JSON text."""
+    mu = _mu()
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError("rect must be a JSON list of four numbers, [x0, y0, x1, y1].")
+    try:
+        rect = mu.Rect(value)
+    except Exception:
+        raise ValueError("rect must be a JSON list of four numbers, [x0, y0, x1, y1].")
+    rect.normalize()
+    if rect.is_empty or rect.is_infinite:
+        raise ValueError("rect must enclose an area, [x0, y0, x1, y1] with x0 < x1 and y0 < y1.")
+    return rect
+
+
+def render_pdf_region(
+    path: str,
+    page: int,
+    rect,
+    dpi: int = 200,
+    pad: float = 18.0,
+    max_side: int = 1200,
+    quality: int = 85,
+) -> tuple[bytes, str, dict[str, Any]]:
+    """Draw a close-up of one area of a page as a JPEG.
+
+    `rect` is in the page's own coordinates, as find_text, redact_text and
+    the form boxes report them (before the page is turned for display). The
+    area is padded, widened to the left to take in a printed label and a
+    little to the right for the text that follows, kept at least 160 x 40
+    pt, and limited to the page. Returns (image bytes, mime
+    type, details).
+    """
+    mu = _mu()
+    doc = _open_document(path)
+    try:
+        count = doc.page_count
+        try:
+            number = int(page)
+        except Exception:
+            raise ValueError(f"page must be a whole number between 1 and {count}.")
+        if number < 1 or number > count:
+            raise ValueError(
+                f"This PDF has {count} page(s); page {number} does not exist."
+            )
+        _show_stored_drawings(doc)
+        pg = doc[number - 1]
+        # Turned the way a reader sees the page, so "left" is the reader's left.
+        area = _as_rect(rect) * pg.rotation_matrix
+        area.normalize()
+        pad = max(0.0, float(pad))
+        frame = mu.Rect(
+            area.x0 - pad - min(120.0, 2 * area.width + 40),
+            area.y0 - pad,
+            area.x1 + pad + min(60.0, area.width + 20),
+            area.y1 + pad,
+        )
+        if frame.width < 160:
+            grow = (160 - frame.width) / 2
+            frame.x0, frame.x1 = frame.x0 - grow, frame.x1 + grow
+        if frame.height < 40:
+            grow = (40 - frame.height) / 2
+            frame.y0, frame.y1 = frame.y0 - grow, frame.y1 + grow
+        frame &= pg.rect
+        if frame.is_empty:
+            raise ValueError(
+                f"rect {list(round(v, 2) for v in _as_rect(rect))} is outside page {number}."
+            )
+        dpi = max(40, min(int(dpi or 200), 300))
+        longest = max(frame.width, frame.height) / 72.0  # inches
+        if longest * dpi > max_side:
+            dpi = max(40, int(max_side / longest))
+        pix = pg.get_pixmap(dpi=dpi, clip=frame, alpha=False, annots=True)
+        data = pix.tobytes("jpeg", jpg_quality=max(30, min(int(quality), 95)))
+        details = {
+            "page": number,
+            "dpi": dpi,
+            "frame": [round(v, 2) for v in frame],
+            "width": pix.width,
+            "height": pix.height,
+            "bytes": len(data),
+            "format": "jpeg",
+        }
+        return data, "image/jpeg", details
     finally:
         try:
             doc.close()
@@ -1926,6 +2021,56 @@ def _read_back(
             pass
 
 
+def _changed_boxes(
+    boxes: dict[str, list[dict[str, Any]]], fields
+) -> list[dict[str, Any]]:
+    """One area per written field per page: the union of the field's boxes there."""
+    mu = _mu()
+    out: list[dict[str, Any]] = []
+    for name in fields:
+        by_page: dict[int, Any] = {}
+        for b in boxes.get(name) or []:
+            if not b.get("rect"):
+                continue
+            r = mu.Rect(b["rect"])
+            by_page[b["page"]] = by_page[b["page"]] | r if b["page"] in by_page else r
+        for page in sorted(by_page):
+            r = by_page[page]
+            out.append(
+                {
+                    "field": name,
+                    "page": page,
+                    "rect": [round(v, 2) for v in (r.x0, r.y0, r.x1, r.y1)],
+                }
+            )
+    return out
+
+
+def field_area(path: str, field: str, page: Optional[int] = None) -> dict[str, Any]:
+    """{field, page, rect} of a form field's boxes, on `page` or its first page."""
+    doc = _prepared(path)
+    try:
+        boxes = _collect(doc)
+    finally:
+        doc.close()
+    if field not in boxes:
+        raise ValueError(
+            f'No field named "{field}". Use a name from list_form_fields, or pass rect instead '
+            "(a flattened copy has no fields)."
+        )
+    areas = _changed_boxes(boxes, [field])
+    if page is None:
+        return areas[0]
+    for a in areas:
+        if a["page"] == int(page):
+            return a
+    raise ValueError(
+        f'Field "{field}" is not on page {page}; it is on page(s) '
+        + ", ".join(str(a["page"]) for a in areas)
+        + "."
+    )
+
+
 def fill_pdf_fields(
     path: str,
     values: dict[str, Any],
@@ -1941,7 +2086,8 @@ def fill_pdf_fields(
     of a field's options; those fields are left as they were. Pass a dict as
     `report` to receive what was written and whether it reads back: filled,
     remapped, blank, replaced, filler, ambiguous, did_not_stick, still_empty,
-    pages_touched, shrunk ({name: pt}), cut_off, split_fields.
+    pages_touched, shrunk ({name: pt}), cut_off, split_fields,
+    changed_boxes ([{field, page, rect}]).
     """
     mu = _mu()
     prep: dict[str, Any] = {}
@@ -2056,6 +2202,7 @@ def fill_pdf_fields(
                     "shrunk": shrunk,
                     "cut_off": sorted(cut_off),
                     "split_fields": split,
+                    "changed_boxes": _changed_boxes(boxes, clean),
                 }
             )
         return data, unknown
@@ -2102,11 +2249,23 @@ class Tools:
             description="Largest page image, in kilobytes, sent to the model. Larger pages are sent as JPEG or at lower resolution.",
         )
 
-        review_pages: int = Field(
-            default=3,
+        review_crops: int = Field(
+            default=12,
             description=(
-                "How many filled pages fill_form shows the model for checking (0 to 4). Only pages that were "
-                "written to are shown. Needs Open WebUI 0.11.4 or later; older versions ask the model to call render_page."
+                "How many close-ups fill_form and redact_text show the model for checking (0 to 30): one JPEG "
+                "per field written or text removed. 0 sends none. Needs Open WebUI 0.11.4 or later; older "
+                "versions ask the model to call render_page."
+            ),
+        )
+        crop_dpi: int = Field(
+            default=200,
+            description="Resolution of those close-ups (72 to 300).",
+        )
+        review_pages: int = Field(
+            default=0,
+            description=(
+                "How many whole pages fill_form and redact_text also show the model (0 to 4), besides the "
+                "close-ups. Only pages that were changed are shown. Needs Open WebUI 0.11.4 or later."
             ),
         )
 
@@ -2294,6 +2453,46 @@ class Tools:
                     continue
         return images
 
+    def _review_crops(
+        self, pdf_bytes: bytes, items: list[dict[str, Any]], key: str
+    ) -> tuple[dict[str, str], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Close-ups for the model, one per item, up to review_crops.
+
+        `items` carry page and rect, and `key` names their label ("field" or
+        "id"). Returns (images by name, the matching list for the text part
+        of the result, the items not shown).
+        """
+        limit = max(0, min(int(self.valves.review_crops or 0), 30))
+        if not limit or not self._host_shows_images_in_results():
+            return {}, [], list(items)
+        images: dict[str, str] = {}
+        shown: list[dict[str, Any]] = []
+        missed: list[dict[str, Any]] = []
+        for item in items:
+            if len(images) >= limit:
+                missed.append(item)
+                continue
+            try:
+                data, mime, _ = render_pdf_region(
+                    pdf_bytes,
+                    page=item["page"],
+                    rect=item["rect"],
+                    dpi=max(72, min(int(self.valves.crop_dpi or 200), 300)),
+                )
+            except Exception:
+                missed.append(item)
+                continue
+            name = f"{item[key]} (p{item['page']})"
+            while name in images:
+                name += "'"
+            images[name] = (
+                f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+            )
+            shown.append(
+                {"image": name, key: item[key], "page": item["page"], "rect": item["rect"]}
+            )
+        return images, shown, missed
+
     # ---- tools exposed to the model -------------------------------------
 
     async def list_form_fields(
@@ -2327,8 +2526,10 @@ class Tools:
 
     async def render_page(
         self,
-        page: int = 1,
+        page: Optional[int] = None,
         file_id: str = "",
+        field: str = "",
+        rect: str = "",
         show_in_chat: Optional[bool] = None,
         __user__: Optional[dict] = None,
         __files__: Optional[list] = None,
@@ -2338,21 +2539,39 @@ class Tools:
         Look at one page of a PDF as an image. Use it to check that a filled form
         looks right, or to read a form that has no fillable fields (a flat or
         scanned form). Needs a model that can read images. Returns one page per
-        call; call again for another page.
-        :param page: Page number, starting at 1.
+        call; call again for another page. Give field or rect for a sharper
+        close-up of one area instead of the whole page.
+        :param page: Page number, starting at 1. Defaults to 1, or to the field's first page when field is given.
         :param file_id: Id of the PDF. Leave empty when only one PDF is attached. To look at a form you just filled, pass the file_id that fill_form returned.
+        :param field: Optional. Name of a form field to show close up, as in list_form_fields.
+        :param rect: Optional. Area to show close up, as a JSON list [x0, y0, x1, y1] copied from crops_not_shown, crops, find_text or redact_text.
         :param show_in_chat: Leave unset. Only set true when the user asks to see the page image themselves.
         :return: The page as an image.
         """
         try:
             user_id = (__user__ or {}).get("id")
             fid, path, name = await self._pick_file(file_id, __files__, user_id)
-            data, mime, details = render_pdf_page(
-                path,
-                page=page,
-                dpi=self.valves.render_dpi,
-                max_kb=self.valves.render_max_kb,
-            )
+            field = str(field or "").strip()
+            rect = rect.strip() if isinstance(rect, str) else rect
+            if field and rect:
+                return json.dumps({"error": "Give field or rect, not both."})
+            if field:
+                area = field_area(path, field, page)
+                page, rect = area["page"], area["rect"]
+            if rect:
+                data, mime, details = render_pdf_region(
+                    path,
+                    page=1 if page is None else page,
+                    rect=rect,
+                    dpi=max(72, min(int(self.valves.crop_dpi or 200), 300)),
+                )
+            else:
+                data, mime, details = render_pdf_page(
+                    path,
+                    page=1 if page is None else page,
+                    dpi=self.valves.render_dpi,
+                    max_kb=self.valves.render_max_kb,
+                )
         except Exception as e:
             return json.dumps({"error": str(e)})
 
@@ -2431,16 +2650,17 @@ class Tools:
         a value, send "" for it. Values in text_cut_off do not fit their
         boxes even at the smallest readable size: shorten them and call
         fill_form again. Before telling the user the form is complete, look
-        at every page in pages_touched: either in page_images of this
-        result, or with render_page. If a value is missing on the image,
-        call fill_form again. A line printed on the form that has no field
+        at every close-up in crop_images (one per field written, listed in
+        crops), and call render_page for each entry in crops_not_shown. If
+        a value is missing, wrong or cut off on the image, call fill_form
+        again. A line printed on the form that has no field
         cannot be filled: say so to the user rather than describing it as
         done. To flatten a copy you already filled, call flatten_form.
         :param values: JSON object mapping field names to values, e.g. {"Name": "Jane Doe", "Date": "09/16/2026"}. Include every field you want filled in ONE call. For a checkbox use true or false; for a radio group use the option value from list_form_fields (for example "/A"). May be {} only together with flatten=true.
         :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
         :param output_name: File name for the filled copy. Defaults to "<original>-filled.pdf".
         :param flatten: Leave unset. Only set true when the user explicitly asks for a flattened or non-editable PDF.
-        :return: A summary: status, what was not written and why, the pages to check, and the full download URL of the filled PDF. When the user asks for a link, give them download_link_markdown verbatim.
+        :return: A summary: status, what was not written and why, a close-up of each field written, and the full download URL of the filled PDF. When the user asks for a link, give them download_link_markdown verbatim.
         """
         try:
             user_id = (__user__ or {}).get("id")
@@ -2524,8 +2744,10 @@ class Tools:
             )
 
             pages = report.get("pages_touched") or []
+            crop_images, crops, not_shown = self._review_crops(
+                pdf_bytes, report.get("changed_boxes") or [], "field"
+            )
             images = self._review_images(pdf_bytes, pages)
-            unseen = [n for n in pages if f"page_{n}" not in images]
 
             steps = []
             if problems.get("split_fields"):
@@ -2545,11 +2767,13 @@ class Tools:
                     f'are cut off on the page. Shorten them and call fill_form again with file_id "{new_id}" '
                     "and only those fields. Do not tell the user the form is complete while a value is cut off."
                 )
-            if images:
+            if crop_images:
                 steps.append(
-                    "Look at page_images and compare every value with what was asked. "
-                    "If one is missing or cut off, call fill_form again."
+                    "Look at crop_images: each is a close-up of one field (see crops for which). Compare "
+                    "every value with what was asked. If one is missing, wrong or cut off, call fill_form again."
                 )
+            if images:
+                steps.append("page_images show the whole pages.")
             filler = report.get("filler") or []
             if filler:
                 steps.append(
@@ -2568,10 +2792,11 @@ class Tools:
                     "The fields in still_empty hold no value. If the request covers one of them, call fill_form "
                     f'again with file_id "{new_id}" and only those fields; leave the rest empty. Do not ask the user.'
                 )
-            if unseen:
+            if not_shown:
                 steps.append(
-                    f'Call render_page with file_id "{new_id}" for page(s) {", ".join(str(n) for n in unseen)} '
-                    "and check the values before telling the user the form is complete."
+                    f'Call render_page with file_id "{new_id}" and the page and rect of each entry in '
+                    "crops_not_shown (or with only the page, to see a whole page at once), and check the values "
+                    "before telling the user the form is complete."
                 )
 
             result: dict[str, Any] = {"status": "partial" if problems else "ok"}
@@ -2606,10 +2831,17 @@ class Tools:
                 result["replaced_values"] = report["replaced"]
             if filler:
                 result["filler_values"] = filler
-            if images:
+            if crops:
+                result["crops"] = crops
+            if not_shown:
+                result["crops_not_shown"] = not_shown
+            if crop_images or images:
                 # Returned as a dict: Open WebUI takes the pictures out for the
                 # model and turns the rest into JSON text.
-                result["page_images"] = images
+                if crop_images:
+                    result["crop_images"] = crop_images
+                if images:
+                    result["page_images"] = images
                 return result
             return json.dumps(result, indent=2)
         except Exception as e:
@@ -2632,7 +2864,7 @@ class Tools:
         in one step, call fill_form with flatten=true instead.
         :param file_id: Id of the filled PDF to flatten. Leave empty when only one PDF is attached.
         :param output_name: File name for the flattened copy. Defaults to "<original>-flattened.pdf".
-        :return: A summary with the page images to check and the full download URL of the flattened PDF.
+        :return: A summary with the full download URL of the flattened PDF.
         """
         return await self.fill_form(
             values="{}",
@@ -2707,14 +2939,15 @@ class Tools:
         When status is "partial", read not_found, stale and unverified, call
         find_text on the returned file_id, and call redact_text again for
         what remains. Before telling the user the text is gone, look at
-        page_images, or call render_page for pages that are not shown. To
+        every close-up in crop_images (one per hit, listed in crops), and
+        call render_page for each entry in crops_not_shown. To
         redact more text afterwards, call find_text with the returned
         file_id, not the original.
         :param hits: JSON list of hit ids from find_text, e.g. ["p1:12:5-10", "p2:3:0-8"]. An entry may also be {"id": "...", "text": "..."} to require that the text at that place still reads that way.
         :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
         :param output_name: File name for the redacted copy. Defaults to "<original>-redacted.pdf".
         :param fill: "white" leaves the area blank (default); "black" draws a black box over it.
-        :return: A summary: status, what was not redacted and why, the pages to check, and the full download URL of the redacted PDF. When the user asks for a link, give them download_link_markdown verbatim.
+        :return: A summary: status, what was not redacted and why, a close-up of each redacted hit, and the full download URL of the redacted PDF. When the user asks for a link, give them download_link_markdown verbatim.
         """
         try:
             user_id = (__user__ or {}).get("id")
@@ -2766,8 +2999,10 @@ class Tools:
                 pdf_bytes, out_name, user_id, fid, __request__, __event_emitter__
             )
             pages = report.get("pages_touched") or []
+            crop_images, crops, not_shown = self._review_crops(
+                pdf_bytes, report["redacted"], "id"
+            )
             images = self._review_images(pdf_bytes, pages)
-            unseen = [n for n in pages if f"page_{n}" not in images]
 
             steps = []
             if problems.get("not_found") or problems.get("stale"):
@@ -2777,17 +3012,22 @@ class Tools:
                 )
             if problems.get("unverified"):
                 steps.append(
-                    "The hits in unverified still show characters inside the redacted area. Look at the "
-                    "page image; if the text is still readable, tell the user it could not be removed."
+                    "The hits in unverified still show characters inside the redacted area. Look at its "
+                    "close-up; if the text is still readable, tell the user it could not be removed."
+                )
+            if crop_images:
+                steps.append(
+                    "Look at crop_images: each is a close-up of one redacted hit (see crops for which). "
+                    "Confirm the text is gone and the text beside it is intact. If in doubt, call "
+                    f'render_page with file_id "{new_id}" and only the page to see the whole page.'
                 )
             if images:
+                steps.append("page_images show the whole pages.")
+            if not_shown:
                 steps.append(
-                    "Look at page_images and confirm the text is gone and nothing else was removed."
-                )
-            if unseen:
-                steps.append(
-                    f'Call render_page with file_id "{new_id}" for page(s) {", ".join(str(n) for n in unseen)} '
-                    "and check before telling the user the text is gone."
+                    f'Call render_page with file_id "{new_id}" and the page and rect of each entry in '
+                    "crops_not_shown (or with only the page, to see a whole page at once), and check before "
+                    "telling the user the text is gone."
                 )
 
             result: dict[str, Any] = {"status": "partial" if problems else "ok"}
@@ -2807,10 +3047,17 @@ class Tools:
             )
             if report.get("fields_cleared"):
                 result["fields_cleared"] = report["fields_cleared"]
-            if images:
+            if crops:
+                result["crops"] = crops
+            if not_shown:
+                result["crops_not_shown"] = not_shown
+            if crop_images or images:
                 # Returned as a dict: Open WebUI takes the pictures out for the
                 # model and turns the rest into JSON text.
-                result["page_images"] = images
+                if crop_images:
+                    result["crop_images"] = crop_images
+                if images:
+                    result["page_images"] = images
                 return result
             return json.dumps(result, indent=2)
         except Exception as e:

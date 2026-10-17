@@ -1,9 +1,17 @@
-# PDF Form Filler for Open WebUI (PyMuPDF)
+# PDF Tool for Open WebUI (PyMuPDF)
 
 An [Open WebUI](https://github.com/open-webui/open-webui) tool that lets a model
-inspect and fill the form fields (AcroForm) of a PDF attached to the chat,
-return the filled PDF as a downloadable attachment, look at a page as an
-image, and find and redact printed text.
+work on a PDF attached to the chat:
+
+- **Fill forms:** list a form's fields (AcroForm), fill them, and flatten the
+  result if asked.
+- **Redact text:** find printed text and delete exactly those characters from
+  the file.
+- **Check its own work:** after each fill or redaction, the model gets a
+  close-up image of every field or area it changed. It can also look at any
+  page, or zoom in on one area.
+
+Every filled or redacted copy is attached to the chat as a downloadable PDF.
 
 The whole tool is one file: `pdf_tool.py`.
 
@@ -12,11 +20,11 @@ The whole tool is one file: `pdf_tool.py`.
 | Function | Purpose |
 |---|---|
 | `list_form_fields` | List every fillable field: name, type, the label printed next to the box, current value, and valid options. Also gives today's date, for date fields. |
-| `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model the pages it wrote to. Optionally flatten it. |
-| `render_page` | Hand one page to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
+| `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model a close-up of each field it wrote. Optionally flatten it. |
+| `render_page` | Hand one page, or a close-up of one field or area, to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
 | `flatten_form` | Flatten a copy that was already filled, so its values become fixed page content, without resending them. |
 | `find_text` | List every place a piece of text is printed, as whole words, with a hit id, the page, the text as printed and its context on the line. |
-| `redact_text` | Delete exactly the characters behind the given hit ids, redraw any neighbouring characters the box clipped, confirm the text is gone, and attach the redacted PDF to the chat. |
+| `redact_text` | Delete exactly the characters behind the given hit ids, redraw any neighbouring characters the box clipped, confirm the text is gone, attach the redacted PDF to the chat, and show the model a close-up of each hit. |
 
 Flat and scanned PDFs have no fields to fill. The tool reports that instead of
 drawing text over the page.
@@ -40,7 +48,9 @@ drawing text over the page.
 | `min_font_size` | `6.0` | Smallest size, in points, a value is shrunk to so it fits its box. A value that does not fit at this size is drawn cut off and reported, so the model can shorten it. |
 | `render_dpi` | `110` | Resolution of page images sent to the model (40 to 300). |
 | `render_max_kb` | `3000` | Largest page image sent to the model, in kilobytes. Larger pages are sent as JPEG or at lower resolution. |
-| `review_pages` | `3` | How many filled pages `fill_form` shows the model for checking (0 to 4). Only pages that were written to are shown. Needs Open WebUI 0.11.4 or later. |
+| `review_crops` | `12` | How many close-ups `fill_form` and `redact_text` show the model for checking (0 to 30): one JPEG per field written or hit removed. Needs Open WebUI 0.11.4 or later. |
+| `crop_dpi` | `200` | Resolution of those close-ups (72 to 300). |
+| `review_pages` | `0` | How many whole changed pages `fill_form` and `redact_text` also show the model, besides the close-ups (0 to 4). Needs Open WebUI 0.11.4 or later. |
 
 ## Usage
 
@@ -54,8 +64,9 @@ makes three calls:
    {"Name": "Jane Doe", "Date": "09/16/2026", "Agree": true, "Plan": "/A"}
    ```
 
-3. `render_page` with the `file_id` that `fill_form` returned, for any page
-   in `pages_touched` that `fill_form` did not already show.
+3. `render_page` with the `file_id` that `fill_form` returned, and the page
+   and `rect` of each entry in `crops_not_shown`, for any field `fill_form`
+   did not already show close up.
 
 When several PDFs are attached, pass `file_id` to choose one.
 
@@ -106,7 +117,7 @@ gone. An id from another file, or from a copy that has since changed, is
 listed in `not_found` or `stale` (when the entry carried a `text` to check)
 and the status is `partial`. When no hit resolves, nothing is written and the
 status is `failed`. The result carries the same `file_id`, download link and
-`page_images` as `fill_form`. To redact more from the result, call
+close-ups (`crop_images`, one per hit, listed in `crops`) as `fill_form`. To redact more from the result, call
 `find_text` with the new `file_id`.
 
 A scanned or image-only PDF has no text layer, so there is nothing to find;
@@ -154,11 +165,16 @@ the like, and `next` tells the model to empty them unless the user asked for
 that text.
 
 `pages_touched` lists the pages that were written to. On Open WebUI 0.11.4
-or later those pages, up to `review_pages`, reach the model as images in the
-same result. On older versions, and for pages over the limit, `next` tells
-the model to call `render_page`. Images reach the model only through a
-tool's return value; `__event_emitter__` shows files to the user, not to the
-model.
+or later the model gets a JPEG close-up of each field written, up to
+`review_crops`, in `crop_images` of the same result. `crops` says which field
+each image shows, with its page and `rect`. A close-up is framed on the
+field's boxes, widened to take in the printed label, and drawn at `crop_dpi`,
+so small print stays readable. Whole pages are sent as well only when
+`review_pages` is above 0. On older versions, and for fields over the limit,
+the fields are listed in `crops_not_shown` and `next` tells the model to call
+`render_page` with their page and `rect`. Images reach the model only
+through a tool's return value; `__event_emitter__` shows files to the user,
+not to the model.
 
 ## What it handles
 
@@ -196,7 +212,7 @@ file store, so it appears as a chat attachment, and is indexed like a normal
 upload so later questions in the chat can read it.
 
 The PDF helpers at the top of the file (`inspect_pdf_fields`,
-`fill_pdf_fields`, `render_pdf_page`, `find_pdf_text`, `redact_pdf_text`) import nothing from Open WebUI and can
+`fill_pdf_fields`, `render_pdf_page`, `render_pdf_region`, `find_pdf_text`, `redact_pdf_text`) import nothing from Open WebUI and can
 be used on their own:
 
 ```python
