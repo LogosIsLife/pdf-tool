@@ -611,44 +611,151 @@ ok(
     f"ink ends at {end:.0f} pt, text is {need:.0f} pt, box is {w.rect.width:.0f} pt",
 )
 
-# 11 page images in the result, where Open WebUI takes them (0.11.4 on)
+# 11 close-ups in the result, where Open WebUI takes them (0.11.4 on)
+def images_default():
+    T.valves.review_crops, T.valves.review_pages = 12, 0
+
+
+def decoded(uri):
+    assert uri.startswith("data:image/jpeg;base64,") and " " not in uri, uri[:40]
+    return base64.b64decode(uri.split(",", 1)[1])
+
+
+def ink(data, det, rect, page_rect=None, rotation=None):
+    """Dark pixels of a close-up inside `rect` (page coordinates, before turning)."""
+    pm = pymupdf.Pixmap(data)
+    r = pymupdf.Rect(rect)
+    if rotation is not None:
+        r = r * rotation
+        r.normalize()
+    k = det["dpi"] / 72
+    x0, y0 = det["frame"][0], det["frame"][1]
+    n = 0
+    for x in range(max(0, int((r.x0 - x0) * k)), min(pm.width, int((r.x1 - x0) * k))):
+        for y in range(max(0, int((r.y0 - y0) * k)), min(pm.height, int((r.y1 - y0) * k))):
+            if sum(pm.pixel(x, y)[:3]) < 300:
+                n += 1
+    return n
+
+
 ok(
-    "no page images on an older Open WebUI",
-    isinstance(run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])), str),
+    "no images on an older Open WebUI; the close-ups are left to render_page",
+    isinstance(r := run(T.fill_form(json.dumps(sent), __user__=USER, __files__=[f5])), str)
+    and "crops_not_shown" in json.loads(r)
+    and "crops_not_shown" in json.loads(r)["next"],
 )
 sys.modules["open_webui.utils"] = types.ModuleType("open_webui.utils")
 mw = types.ModuleType("open_webui.utils.middleware")
 mw.extract_base64_images = lambda value, files: value
 sys.modules["open_webui.utils.middleware"] = mw
 sys.modules["open_webui.utils"].middleware = mw
+images_default()
 both = dict(sent, **{"Initial Mailing Address": "9 Elm St", "Date:": "09/28/2026"})
+rep_ = {}
+tool.fill_pdf_fields(f"{PROJ}/205_boc_test.pdf", both, report=rep_)
+areas = rep_["changed_boxes"]
 o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
+want = min(len(areas), 12)
 ok(
-    "touched pages come back as images",
+    "each field written comes back as its own JPEG close-up, no whole pages",
     isinstance(o, dict)
-    and sorted(o.get("page_images", {})) == ["page_1", "page_2", "page_3"]
-    and all(
-        v.startswith("data:image/") and " " not in v for v in o["page_images"].values()
-    ),
-    str(o.get("pages_touched") if isinstance(o, dict) else o[:80]),
+    and len(o.get("crop_images", {})) == want
+    and [c["image"] for c in o.get("crops", [])] == list(o["crop_images"])
+    and all(len(decoded(v)) > 0 for v in o["crop_images"].values())
+    and "page_images" not in o
+    and "crop_images" in o.get("next", ""),
+    f"{len(areas)} areas, {len((o or {}).get('crop_images', {}))} images",
 )
-T.valves.review_pages = 1
+from PIL import Image
+
+sizes = [Image.open(io.BytesIO(decoded(v))).size for v in o["crop_images"].values()]
+ok(
+    "close-ups are small and sharp: long side at most 1200 px",
+    all(max(sz) <= 1200 and min(sz) >= 40 for sz in sizes),
+    str(sizes[:5]),
+)
+filled_path = STORE[o["file_id"]].path
+inked = []
+for c in o["crops"]:
+    data, _, det = tool.render_pdf_region(filled_path, c["page"], c["rect"], dpi=200)
+    inked.append((c["field"], ink(data, det, c["rect"])))
+ok(
+    "every close-up shows ink inside the field it is for",
+    all(n > 0 for _, n in inked),
+    str([f for f, n in inked if n == 0]),
+)
+T.valves.review_crops = 2
 o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
 ok(
-    "pages over the limit are left to render_page",
-    list(o.get("page_images", {})) == ["page_1"]
-    and "page(s) 2, 3" in o.get("next", ""),
-    o.get("next", "")[-150:],
+    "review_crops caps the close-ups and the rest go to render_page",
+    len(o.get("crop_images", {})) == 2
+    and len(o.get("crops_not_shown", [])) == len(areas) - 2
+    and "crops_not_shown" in o.get("next", ""),
+    o.get("next", "")[-160:],
 )
-T.valves.review_pages = 0
+T.valves.review_crops, T.valves.review_pages = 12, 3
+o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
 ok(
-    "review_pages=0 sends no images",
+    "review_pages adds whole pages beside the close-ups",
+    sorted(o.get("page_images", {})) == ["page_1", "page_2", "page_3"]
+    and len(o.get("crop_images", {})) == want,
+    str(sorted(o.get("page_images", {}))),
+)
+T.valves.review_crops = T.valves.review_pages = 0
+ok(
+    "review_crops=0 and review_pages=0 send no images",
     isinstance(run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5])), str),
 )
-T.valves.review_pages = 3
+images_default()
+
+# render_page close-ups
+o = run(T.fill_form(json.dumps(both), __user__=USER, __files__=[f5]))
+o_crops = o["crops"]
+fname = o_crops[0]["field"]
+ff = {"id": o["file_id"], "name": "filled.pdf", "content_type": "application/pdf"}
+r = run(T.render_page(field=fname, __user__=USER, __files__=[ff]))
+ok("render_page with field gives a JPEG close-up", r.startswith("data:image/jpeg;base64,"), r[:60])
+r = run(T.render_page(page=o_crops[0]["page"], rect=json.dumps(o_crops[0]["rect"]), __user__=USER, __files__=[ff]))
+ok("render_page with rect gives a JPEG close-up", r.startswith("data:image/jpeg;base64,"), r[:60])
+r = run(T.render_page(__user__=USER, __files__=[ff]))
+ok("render_page with neither still gives the whole page", r.startswith("data:image/"), r[:40])
+for label, kw, needle in (
+    ("an unknown field", {"field": "No Such Field"}, "No field named"),
+    ("field and rect together", {"field": fname, "rect": "[0,0,10,10]"}, "not both"),
+    ("a malformed rect", {"rect": "[1, 2]"}, "four numbers"),
+    ("a rect off the page", {"rect": "[5000, 5000, 5100, 5100]"}, "outside page"),
+    ("a field on another page", {"field": fname, "page": 99}, "not on page"),
+):
+    r = run(T.render_page(__user__=USER, __files__=[ff], **kw))
+    ok(f"render_page with {label} -> readable error", needle in json.loads(r).get("error", ""), r[:120])
+
+# a turned and cropped page: the close-up must still frame the value
+rd = pymupdf.open()
+rp = rd.new_page(width=400, height=600)
+wd = pymupdf.Widget()
+wd.field_type, wd.field_name = pymupdf.PDF_WIDGET_TYPE_TEXT, "Turned"
+wd.rect = pymupdf.Rect(80, 140, 260, 162)
+rp.add_widget(wd)
+rp.set_cropbox(pymupdf.Rect(20, 30, 380, 560))
+rp.set_rotation(90)
+rd.save(f"{OUT}/turned.pdf")
+rd.close()
+STORE["f-turn"] = Rec(id="f-turn", user_id="u1", filename="turned.pdf", path=f"{OUT}/turned.pdf")
+ft = {"id": "f-turn", "name": "turned.pdf", "content_type": "application/pdf"}
+o = run(T.fill_form(json.dumps({"Turned": "WWWWWWWW"}), __user__=USER, __files__=[ft]))
+c = (o.get("crops") or [{}])[0] if isinstance(o, dict) else {}
+tp = STORE[o["file_id"]].path if isinstance(o, dict) else ""
+data, _, det = tool.render_pdf_region(tp, c["page"], c["rect"], dpi=200)
+turn = pymupdf.open(tp)[0]
+n = ink(data, det, c["rect"], rotation=turn.rotation_matrix)
+ok(
+    "on a turned, cropped page the close-up shows the value",
+    n > 50 and det["height"] > det["width"],
+    f"ink={n} size={det['width']}x{det['height']} rect={c.get('rect')}",
+)
 
 # 12 emptying a box, filler, values written over, and what the listing says
-T.valves.review_pages = 0  # results as text
+T.valves.review_pages = T.valves.review_crops = 0  # results as text
 src = f"{PROJ}/205_boc_test.pdf"
 held = {
     "City:": "Zzyzx",
@@ -833,10 +940,10 @@ ok(
     lab.get("label_above") == "Spouse/ Partner",
     str(lab),
 )
-T.valves.review_pages = 3
+images_default()
 
 # 13 a field drawn in several differently labelled boxes is split, one field per box
-T.valves.review_pages = 0  # results as text
+T.valves.review_pages = T.valves.review_crops = 0  # results as text
 src = f"{PROJ}/CME Broadcast Consent Template.pdf"
 fb = attach("CME Broadcast Consent Template.pdf", "f-bc")
 I = tool.inspect_pdf_fields(src)
@@ -1280,7 +1387,7 @@ ok(
     and "split_fields" not in listing.get("note", ""),
     listing.get("note", "")[-200:],
 )
-T.valves.review_pages = 3
+images_default()
 
 
 # 17 find_text / redact_text: whole-word, glyph-precise redaction
@@ -1348,11 +1455,13 @@ o = as_dict(
     )
 )
 ok(
-    "redact_text reports ok with the download link and the page image",
+    "redact_text reports ok with the download link and a close-up of the hit",
     o.get("status") == "ok"
     and o.get("file_name") == "redact-src-redacted.pdf"
     and o.get("download_url", "").startswith("https://example.test/")
-    and "page_1" in (o.get("page_images") or {})
+    and list(o.get("crop_images") or {}) == [f"{hit['id']} (p1)"]
+    and o.get("crops", [{}])[0].get("id") == hit["id"]
+    and "page_images" not in o
     and o.get("redacted", [{}])[0].get("verified") is True,
     o.get("next", "")[:160],
 )
@@ -1366,6 +1475,13 @@ ok(
 rect = pymupdf.Rect(hit["rect"])
 img, _, det = tool.render_pdf_page(red_path, page=1)
 ok("the redacted area is blank on the page image", dark(img, rect, det["dpi"]) == 0)
+data, _, det = tool.render_pdf_region(red_path, 1, hit["rect"], dpi=200)
+beside = pymupdf.Rect(rect.x0 - 25, rect.y0, rect.x0 - 2, rect.y1)
+ok(
+    "the close-up shows the area blank and the words beside it intact",
+    ink(data, det, rect) == 0 and ink(data, det, beside) > 0,
+    f"in hit={ink(data, det, rect)} beside={ink(data, det, beside)}",
+)
 
 _, src_chars = plumb(f"{OUT}/redact-src.pdf")
 date = json.loads(run(T.find_text("6/9/2026", __user__=USER, __files__=[fr])))

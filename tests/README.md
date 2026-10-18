@@ -44,7 +44,9 @@ A form passes when it prints no `PROBLEM` line. What each line means:
 
 Runs `list_form_fields`, `fill_form` and `flatten_form` against stand-ins for
 the Open WebUI modules, including name matching, the read-back of written
-values, the `status` contract and the page images in the result. It also
+values, the `status` contract, the close-ups in the result (one JPEG per field
+or redacted hit, framed on it, including on a turned and cropped page) and
+`render_page` with `field` or `rect`. It also
 covers the 1.4.0 behaviour: a field drawn in several differently labelled
 boxes is split into one field per box; text is shrunk to fit its box but never
 below `min_font_size`, wrapped text stops at the bottom of the box, and a value
