@@ -1282,6 +1282,218 @@ ok(
 )
 T.valves.review_pages = 3
 
+
+# 17 find_text / redact_text: whole-word, glyph-precise redaction
+import re
+
+rd = pymupdf.open()
+rp = rd.new_page()
+rp.insert_text(
+    (72, 100), "Flare-up lasts 2 day(s) per episode", fontname="helv", fontsize=11
+)
+rp.insert_text((72, 130), "Allow 12 day notice", fontname="helv", fontsize=11)
+rp.insert_text((72, 160), "Name: Jane Doe", fontname="helv", fontsize=11)
+rp.insert_text(
+    (72, 190), "from ___________ through ___________", fontname="helv", fontsize=11
+)
+rp.insert_text(
+    (102, 190), "6/9/2026", fontname="helv", fontsize=11
+)  # over the first underscores
+rd.save(f"{OUT}/redact-src.pdf")
+rd.close()
+STORE["f-red"] = Rec(
+    id="f-red", user_id="u1", filename="redact-src.pdf", path=f"{OUT}/redact-src.pdf"
+)
+fr = {"id": "f-red", "name": "redact-src.pdf", "content_type": "application/pdf"}
+as_dict = lambda o: json.loads(o) if isinstance(o, str) else o
+
+
+def plumb(path):
+    with pdfplumber.open(path) as pl:
+        return pl.pages[0].extract_text() or "", pl.pages[0].chars
+
+
+found = json.loads(run(T.find_text("2 day", __user__=USER, __files__=[fr])))
+hit = (found.get("hits") or [{}])[0]
+ok(
+    "find_text finds '2 day' once, as a whole word, not inside '12 day'",
+    found.get("count") == 1
+    and hit.get("text") == "2 day"
+    and hit.get("id", "").startswith("p1:")
+    and "[2 day](s)" in hit.get("context", ""),
+    json.dumps(found.get("hits")),
+)
+ok(
+    "find_text with whole_word=false also matches inside words",
+    json.loads(
+        run(T.find_text("day", whole_word=False, __user__=USER, __files__=[fr]))
+    ).get("count")
+    == 2,
+)
+ok(
+    "find_text says when nothing matches",
+    "whole word"
+    in json.loads(run(T.find_text("zebra", __user__=USER, __files__=[fr]))).get(
+        "note", ""
+    ),
+)
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps([hit["id"]]),
+            __user__=USER,
+            __files__=[fr],
+            __event_emitter__=emit,
+        )
+    )
+)
+ok(
+    "redact_text reports ok with the download link and the page image",
+    o.get("status") == "ok"
+    and o.get("file_name") == "redact-src-redacted.pdf"
+    and o.get("download_url", "").startswith("https://example.test/")
+    and "page_1" in (o.get("page_images") or {})
+    and o.get("redacted", [{}])[0].get("verified") is True,
+    o.get("next", "")[:160],
+)
+red_path = STORE[o["file_id"]].path
+after, _ = plumb(red_path)
+ok(
+    "the redacted file no longer reads '2 day' but keeps '12 day' and the name",
+    not re.search(r"(?<!\d)2 day", after) and "12 day" in after and "Jane Doe" in after,
+    repr(after),
+)
+rect = pymupdf.Rect(hit["rect"])
+img, _, det = tool.render_pdf_page(red_path, page=1)
+ok("the redacted area is blank on the page image", dark(img, rect, det["dpi"]) == 0)
+
+_, src_chars = plumb(f"{OUT}/redact-src.pdf")
+date = json.loads(run(T.find_text("6/9/2026", __user__=USER, __files__=[fr])))
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps([{"id": date["hits"][0]["id"], "text": "6/9/2026"}]),
+            __user__=USER,
+            __files__=[fr],
+        )
+    )
+)
+after, out_chars = plumb(STORE[o["file_id"]].path)
+n_before = sum(1 for c in src_chars if c["text"] == "_")
+n_after = sum(1 for c in out_chars if c["text"] == "_")
+ok(
+    "a value printed over a line of underscores goes and the underscores come back",
+    o.get("status") == "ok"
+    and o.get("restored_glyphs", 0) > 0
+    and "6/9/2026" not in after
+    and n_after == n_before,
+    f"restored={o.get('restored_glyphs')} underscores before={n_before} after={n_after}",
+)
+
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps([{"id": hit["id"], "text": "wrong"}, "p1:0:0-5"]),
+            __user__=USER,
+            __files__=[fr],
+        )
+    )
+)
+ok(
+    "a hit whose text no longer matches is reported stale, status partial",
+    o.get("status") == "partial"
+    and [s["id"] for s in o.get("stale", [])] == [hit["id"]]
+    and len(o.get("redacted", [])) == 1
+    and "find_text" in o.get("next", ""),
+    json.dumps(o.get("stale")),
+)
+n_files = len(STORE)
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps(["p1:99:0-3", "nonsense"]), __user__=USER, __files__=[fr]
+        )
+    )
+)
+ok(
+    "unknown hit ids -> failed, both listed in not_found, no file made",
+    o.get("status") == "failed"
+    and len(o.get("not_found", [])) == 2
+    and len(STORE) == n_files,
+    json.dumps(o.get("not_found")),
+)
+o = as_dict(run(T.redact_text("[]", __user__=USER, __files__=[fr])))
+ok("empty hits -> readable error", "non-empty" in o.get("error", ""))
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps([hit["id"]]), fill="black", __user__=USER, __files__=[fr]
+        )
+    )
+)
+img, _, det = tool.render_pdf_page(STORE[o["file_id"]].path, page=1)
+ok(
+    "fill=black draws a box over the area",
+    o.get("status") == "ok" and dark(img, rect, det["dpi"]) > rect.width - 3,
+    f"ink to {dark(img, rect, det['dpi']):.1f} of {rect.width:.1f} pt",
+)
+# a scanned page: the picture of the fixture, no text layer
+sd = pymupdf.open()
+sp = sd.new_page()
+sp.insert_image(
+    sp.rect, pixmap=pymupdf.open(f"{OUT}/redact-src.pdf")[0].get_pixmap(dpi=100)
+)
+sd.save(f"{OUT}/redact-scan.pdf")
+sd.close()
+STORE["f-scan"] = Rec(
+    id="f-scan", user_id="u1", filename="redact-scan.pdf", path=f"{OUT}/redact-scan.pdf"
+)
+fs = {"id": "f-scan", "name": "redact-scan.pdf", "content_type": "application/pdf"}
+ok(
+    "find_text on a scanned PDF says there is no text layer",
+    "no text layer"
+    in json.loads(run(T.find_text("2 day", __user__=USER, __files__=[fs]))).get(
+        "note", ""
+    ),
+)
+o = as_dict(run(T.redact_text(json.dumps([hit["id"]]), __user__=USER, __files__=[fs])))
+ok(
+    "redact_text on a scanned PDF -> failed, the id is not found",
+    o.get("status") == "failed" and len(o.get("not_found", [])) == 1,
+    json.dumps(o.get("not_found")),
+)
+
+# text typed into a form field: the hit says so and the field is emptied too
+o = as_dict(
+    run(
+        T.fill_form(json.dumps({"Text4": "Zebra Quilt"}), __user__=USER, __files__=[f1])
+    )
+)
+ff = {"id": o["file_id"], "name": o["file_name"], "content_type": "application/pdf"}
+found = json.loads(run(T.find_text("Zebra Quilt", __user__=USER, __files__=[ff])))
+ok(
+    "find_text reports the field a value sits in",
+    found.get("count") == 1 and found["hits"][0].get("in_field") == "Text4",
+    json.dumps(found.get("hits")),
+)
+o = as_dict(
+    run(
+        T.redact_text(
+            json.dumps([found["hits"][0]["id"]]), __user__=USER, __files__=[ff]
+        )
+    )
+)
+fields = PdfReader(STORE[o["file_id"]].path).get_fields() or {}
+after, _ = plumb(STORE[o["file_id"]].path)
+ok(
+    "redacting a field value empties the field and removes the drawing",
+    o.get("status") == "ok"
+    and o.get("fields_cleared") == ["Text4"]
+    and not (fields.get("Text4") or {}).get("/V")
+    and "Zebra Quilt" not in after,
+    f"V={(fields.get('Text4') or {}).get('/V')!r} cleared={o.get('fields_cleared')}",
+)
+
 n = sum(1 for r in results if r[1])
 print(f"\n{TOOL}: {n}/{len(results)} passed")
 [print("   FAILED:", r[0], "|", r[2]) for r in results if not r[1]]

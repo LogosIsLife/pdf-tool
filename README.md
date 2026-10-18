@@ -2,8 +2,8 @@
 
 An [Open WebUI](https://github.com/open-webui/open-webui) tool that lets a model
 inspect and fill the form fields (AcroForm) of a PDF attached to the chat,
-return the filled PDF as a downloadable attachment, and look at a page as an
-image.
+return the filled PDF as a downloadable attachment, look at a page as an
+image, and find and redact printed text.
 
 The whole tool is one file: `pdf_tool.py`.
 
@@ -15,6 +15,8 @@ The whole tool is one file: `pdf_tool.py`.
 | `fill_form` | Fill fields from a JSON object of `{field name: value}`, read every value back, and attach the filled PDF to the chat. Shows the model the pages it wrote to. Optionally flatten it. |
 | `render_page` | Hand one page to the model as an image, to check a filled form or read a flat or scanned one. Needs a model that can read images. |
 | `flatten_form` | Flatten a copy that was already filled, so its values become fixed page content, without resending them. |
+| `find_text` | List every place a piece of text is printed, as whole words, with a hit id, the page, the text as printed and its context on the line. |
+| `redact_text` | Delete exactly the characters behind the given hit ids, redraw any neighbouring characters the box clipped, confirm the text is gone, and attach the redacted PDF to the chat. |
 
 Flat and scanned PDFs have no fields to fill. The tool reports that instead of
 drawing text over the page.
@@ -67,6 +69,59 @@ Field names are matched exactly first, then by a name that differs only in
 letter case, spacing or punctuation, then by the printed label or tooltip
 when exactly one field has it. Such matches are reported in
 `remapped_fields`. A name that fits several fields is not guessed at.
+
+## Redacting text
+
+Redaction is a two-call flow, like filling:
+
+1. `find_text` with the text as printed, for example `"2 day"`. Every
+   occurrence comes back as a hit with an id such as `p1:12:15-20` (page,
+   line, character offsets), the page, the text, its rectangle, and the line
+   around it with the match in brackets:
+
+   ```json
+   {"id": "p1:12:15-20", "page": 1, "text": "2 day",
+    "context": "Flare-up lasts [2 day](s) per episode"}
+   ```
+
+2. `redact_text` with the ids to remove, for example `["p1:12:15-20"]`.
+
+Matching is on whole words, so `2 day` is not found inside `12 day`, and a
+hit is a run of printed characters, not a search string: the redaction box
+is the union of those characters' boxes and nothing else on the page is
+touched. One occurrence of a value can be removed while another stays.
+Letter case matters; runs of spaces do not. `whole_word=false` also matches
+inside words, for the rare case where that is what the user means.
+
+The characters are deleted from the file, not covered. The area is left
+blank (`fill="white"`) or drawn as a black box (`fill="black"`). PyMuPDF
+drops every character whose box touches a redaction box, so a value printed
+over a line of underscores would take part of the line with it; the
+characters outside the hit that vanish are drawn again at their own
+positions and counted in `restored_glyphs`. A hit that sits in a form field
+is reported with `in_field`, and the field's stored value is emptied too.
+
+`status` is `ok` only when every hit resolved and the text was confirmed
+gone. An id from another file, or from a copy that has since changed, is
+listed in `not_found` or `stale` (when the entry carried a `text` to check)
+and the status is `partial`. When no hit resolves, nothing is written and the
+status is `failed`. The result carries the same `file_id`, download link and
+`page_images` as `fill_form`. To redact more from the result, call
+`find_text` with the new `file_id`.
+
+A scanned or image-only PDF has no text layer, so there is nothing to find;
+`find_text` says so.
+
+The helpers work on their own, outside Open WebUI:
+
+```python
+from pdf_tool import find_pdf_text, redact_pdf_text
+
+hits = find_pdf_text("form.pdf", "2 day")["hits"]
+report = {}
+pdf = redact_pdf_text("form.pdf", [h["id"] for h in hits], report=report)
+open("form-redacted.pdf", "wb").write(pdf)
+```
 
 ## What `fill_form` returns
 
@@ -141,7 +196,7 @@ file store, so it appears as a chat attachment, and is indexed like a normal
 upload so later questions in the chat can read it.
 
 The PDF helpers at the top of the file (`inspect_pdf_fields`,
-`fill_pdf_fields`, `render_pdf_page`) import nothing from Open WebUI and can
+`fill_pdf_fields`, `render_pdf_page`, `find_pdf_text`, `redact_pdf_text`) import nothing from Open WebUI and can
 be used on their own:
 
 ```python

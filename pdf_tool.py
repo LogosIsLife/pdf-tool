@@ -1,12 +1,20 @@
 """
 title: PDF Form Filler (PyMuPDF)
 author: darlene
-version: 1.4.0
+version: 1.5.0
 license: AGPL-3.0
-description: Inspect and fill the form fields (AcroForm) of a PDF attached to the chat, return the filled PDF as a downloadable attachment, and show a page to the model as an image.
+description: Inspect and fill the form fields (AcroForm) of a PDF attached to the chat, return the filled PDF as a downloadable attachment, show a page to the model as an image, and find and redact printed text.
 """
 
 # Paste this whole file into Open WebUI: Admin > Tools > + > paste > Save.
+# Changes in 1.5.0:
+#  - find_text and redact_text remove printed text from a PDF. A hit is a run
+#    of characters at a known line and offset, and the redaction box is the
+#    union of those characters' boxes, so "2 day" never takes "12 day" with
+#    it and one occurrence of a value can go while another stays.
+#  - Characters next to a hit that the redaction clips (a value printed over
+#    a line of underscores) are drawn again at their own positions.
+#  - The file-store and page-image steps of fill_form are shared helpers.
 # Changes in 1.4.0 (after the CME forms chat of 2026-10-01):
 #  - A field drawn in several differently labelled boxes (one /T with four
 #    widgets: Topic, Date, Name, Date Signed) is split so each box is its own
@@ -966,6 +974,398 @@ def render_pdf_page(
             pass
 
 
+# ---- text redaction ------------------------------------------------------------
+#
+# Redaction works on the printed characters, not on a string search: a hit is
+# the run of characters at a known line and offset, and the redaction box is
+# the union of those characters' boxes. "2 day" therefore never takes "12 day"
+# with it, and one occurrence of a value can go while another stays.
+
+_HIT_ID = re.compile(r"^p(\d+):(\d+):(\d+)-(\d+)$")
+
+
+def _page_lines(page) -> list[dict[str, Any]]:
+    """The page's text lines, each with one entry per printed character.
+
+    Built from the "rawdict" extraction, so an offset into `text` maps 1:1 to
+    a character with its own box and origin. find_pdf_text and
+    redact_pdf_text both read the page through this, so a hit id from one
+    resolves in the other as long as the file is unchanged.
+    """
+    mu = _mu()
+    flags = mu.TEXT_PRESERVE_WHITESPACE | mu.TEXT_MEDIABOX_CLIP
+    lines: list[dict[str, Any]] = []
+    for block in page.get_text("rawdict", flags=flags)["blocks"]:
+        for line in block.get("lines", []):
+            chars = []
+            for span in line.get("spans", []):
+                size = float(span.get("size") or 0)
+                for ch in span.get("chars", []):
+                    chars.append(
+                        {
+                            "c": ch["c"],
+                            "bbox": mu.Rect(ch["bbox"]),
+                            "origin": (float(ch["origin"][0]), float(ch["origin"][1])),
+                            "size": size,
+                        }
+                    )
+            if chars:
+                lines.append(
+                    {
+                        "index": len(lines),
+                        "text": "".join(c["c"] for c in chars),
+                        "chars": chars,
+                    }
+                )
+    return lines
+
+
+def _squeeze(text: str) -> tuple[str, list[int]]:
+    """Collapse runs of whitespace; return the result and, per kept character, its offset in `text`."""
+    out: list[str] = []
+    back: list[int] = []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if out and out[-1] == " ":
+                continue
+            out.append(" ")
+        else:
+            out.append(ch)
+        back.append(i)
+    return "".join(out), back
+
+
+def _char_rect(chars: list[dict[str, Any]]):
+    mu = _mu()
+    rect = mu.Rect(chars[0]["bbox"])
+    for c in chars[1:]:
+        rect |= c["bbox"]
+    return rect
+
+
+def _field_at(page, rect) -> Optional[str]:
+    """The name of the form field whose box holds the centre of `rect`, if any."""
+    cx, cy = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
+    try:
+        for w in page.widgets():
+            r = w.rect
+            if r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1:
+                return w.field_name or ""
+    except Exception:
+        pass
+    return None
+
+
+def find_pdf_text(
+    path: str, text: str, whole_word: bool = True, pages: Optional[list] = None
+) -> dict[str, Any]:
+    """Every place `text` is printed, with a hit id redact_pdf_text accepts.
+
+    Whitespace runs count as one space on both sides. With `whole_word` the
+    character before and after the match must not be a letter or digit, so
+    "2 day" is not found inside "12 day". A hit id is
+    "p<page>:<line>:<start>-<end>" and depends only on where the characters
+    sit, not on the query.
+    """
+    query, _ = _squeeze(str(text or ""))
+    query = query.strip()
+    if not query:
+        raise ValueError("text must not be empty.")
+    doc = _open_document(path)
+    try:
+        count = doc.page_count
+        wanted = list(range(1, count + 1))
+        if pages:
+            wanted = []
+            for p in pages:
+                try:
+                    n = int(p)
+                except Exception:
+                    raise ValueError(
+                        f"pages must be whole numbers between 1 and {count}."
+                    )
+                if n < 1 or n > count:
+                    raise ValueError(
+                        f"This PDF has {count} page(s); page {n} does not exist."
+                    )
+                wanted.append(n)
+        hits: list[dict[str, Any]] = []
+        pages_with_text = 0
+        for number in wanted:
+            page = doc[number - 1]
+            lines = _page_lines(page)
+            if lines:
+                pages_with_text += 1
+            for line in lines:
+                raw = line["text"]
+                norm, back = _squeeze(raw)
+                at = 0
+                while True:
+                    s = norm.find(query, at)
+                    if s < 0:
+                        break
+                    e = s + len(query)
+                    at = s + 1
+                    if whole_word:
+                        before = norm[s - 1] if s > 0 else ""
+                        after = norm[e] if e < len(norm) else ""
+                        if before.isalnum() or after.isalnum():
+                            continue
+                    start, end = back[s], back[e - 1] + 1
+                    chars = line["chars"][start:end]
+                    rect = _char_rect(chars)
+                    left = _squeeze(raw[max(0, start - 40) : start])[0]
+                    right = _squeeze(raw[end : end + 40])[0]
+                    hit = {
+                        "id": f"p{number}:{line['index']}:{start}-{end}",
+                        "page": number,
+                        "text": raw[start:end],
+                        "rect": [
+                            round(v, 2) for v in (rect.x0, rect.y0, rect.x1, rect.y1)
+                        ],
+                        "context": ("…" if start > 40 else "")
+                        + left
+                        + "["
+                        + raw[start:end]
+                        + "]"
+                        + right
+                        + ("…" if end + 40 < len(raw) else ""),
+                    }
+                    field = _field_at(page, rect)
+                    if field is not None:
+                        hit["in_field"] = field
+                    hits.append(hit)
+        out: dict[str, Any] = {
+            "query": query,
+            "whole_word": bool(whole_word),
+            "count": len(hits),
+            "hits": hits,
+            "pages_with_text": pages_with_text,
+            "pages": count,
+        }
+        if pages_with_text == 0:
+            out["note"] = (
+                "This PDF has no text layer (scanned or image-only), so there is no text to find "
+                "or redact. Nothing can be matched by text in such a file."
+            )
+        return out
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _parse_hit(item) -> tuple[Optional[str], Optional[str]]:
+    """(id, expected text or None) from a hit id or a {"id", "text"} object."""
+    if isinstance(item, str):
+        return item.strip(), None
+    if isinstance(item, dict):
+        hid = item.get("id")
+        if isinstance(hid, str):
+            text = item.get("text")
+            return hid.strip(), (str(text) if text is not None else None)
+    return None, None
+
+
+def redact_pdf_text(
+    path: str,
+    hits: list,
+    fill=(1, 1, 1),
+    restore_neighbors: bool = True,
+    report: Optional[dict] = None,
+) -> bytes:
+    """Remove exactly the characters behind each hit from find_pdf_text.
+
+    Returns the PDF bytes. `report` (when given) is filled with what was
+    done: `redacted`, `not_found`, `stale`, `unverified`, `restored_glyphs`,
+    `pages_touched`, `fields_cleared`.
+
+    A hit may be an id or {"id": ..., "text": ...}; with a text, the
+    characters at that place must still read the same or the hit is `stale`.
+    PyMuPDF drops every character whose box touches a redaction box, so a
+    value printed over a line of underscores would take part of the line
+    with it. The characters outside the hit that vanish are drawn again at
+    their own positions (`restore_neighbors`), in Helvetica.
+    """
+    mu = _mu()
+    rep: dict[str, Any] = report if report is not None else {}
+    rep.update(
+        {
+            "redacted": [],
+            "not_found": [],
+            "stale": [],
+            "unverified": [],
+            "restored_glyphs": 0,
+            "pages_touched": [],
+            "fields_cleared": [],
+        }
+    )
+    by_page: dict[int, list[tuple[str, int, int, int, Optional[str]]]] = {}
+    seen: set[str] = set()
+    for item in hits or []:
+        hid, expected = _parse_hit(item)
+        if not hid:
+            rep["not_found"].append(
+                {"id": str(item)[:80], "reason": "not a hit id from find_text"}
+            )
+            continue
+        if hid in seen:
+            continue
+        seen.add(hid)
+        m = _HIT_ID.match(hid)
+        if not m:
+            rep["not_found"].append(
+                {"id": hid, "reason": "not a hit id from find_text"}
+            )
+            continue
+        page_no, line_no, start, end = (int(g) for g in m.groups())
+        by_page.setdefault(page_no, []).append((hid, line_no, start, end, expected))
+
+    doc = _open_document(path)
+    try:
+        count = doc.page_count
+        for page_no in sorted(by_page):
+            if page_no < 1 or page_no > count:
+                for hid, *_ in by_page[page_no]:
+                    rep["not_found"].append(
+                        {"id": hid, "reason": f"page {page_no} does not exist"}
+                    )
+                continue
+            page = doc[page_no - 1]
+            lines = _page_lines(page)
+            targets: list[dict[str, Any]] = []
+            taken: set[tuple[int, int]] = set()
+            for hid, line_no, start, end, expected in by_page[page_no]:
+                if line_no >= len(lines) or not (
+                    0 <= start < end <= len(lines[line_no]["text"])
+                ):
+                    rep["not_found"].append(
+                        {
+                            "id": hid,
+                            "reason": "no text at that place; the file may have changed",
+                        }
+                    )
+                    continue
+                found = lines[line_no]["text"][start:end]
+                if (
+                    expected is not None
+                    and _squeeze(expected)[0].strip() != _squeeze(found)[0].strip()
+                ):
+                    rep["stale"].append(
+                        {"id": hid, "expected": expected, "found": found}
+                    )
+                    continue
+                chars = lines[line_no]["chars"][start:end]
+                rect = _char_rect(chars)
+                targets.append(
+                    {"id": hid, "text": found, "rect": rect, "line": line_no}
+                )
+                taken.update((line_no, i) for i in range(start, end))
+            if not targets:
+                continue
+
+            # Characters outside every hit whose box touches a hit box: PyMuPDF
+            # will drop them too, so remember where they were.
+            at_risk: list[dict[str, Any]] = []
+            for line in lines:
+                for i, c in enumerate(line["chars"]):
+                    if (line["index"], i) in taken or c["c"].isspace():
+                        continue
+                    if any(c["bbox"].intersects(t["rect"]) for t in targets):
+                        at_risk.append(c)
+
+            cleared: list[str] = []
+            for t in targets:
+                field = _field_at(page, t["rect"])
+                if field is not None:
+                    t["in_field"] = field
+                    for w in page.widgets():
+                        if (w.field_name or "") == field:
+                            try:
+                                _clear_value(doc, w)
+                                if field not in cleared:
+                                    cleared.append(field)
+                            except Exception:
+                                pass
+                page.add_redact_annot(t["rect"], fill=fill)
+            page.apply_redactions(
+                images=mu.PDF_REDACT_IMAGE_PIXELS,
+                graphics=mu.PDF_REDACT_LINE_ART_NONE,
+                text=mu.PDF_REDACT_TEXT_REMOVE,
+            )
+            rep["fields_cleared"].extend(cleared)
+
+            def still_there(c, lines_now) -> bool:
+                ox, oy = c["origin"]
+                for line in lines_now:
+                    for d in line["chars"]:
+                        if (
+                            d["c"] == c["c"]
+                            and abs(d["origin"][0] - ox) < 0.5
+                            and abs(d["origin"][1] - oy) < 0.5
+                        ):
+                            return True
+                return False
+
+            after = _page_lines(page)
+            restored: list[dict[str, Any]] = []
+            if restore_neighbors and at_risk:
+                gone = [c for c in at_risk if not still_there(c, after)]
+                if gone:
+                    writer = mu.TextWriter(page.rect)
+                    font = mu.Font("helv")
+                    for c in gone:
+                        writer.append(
+                            mu.Point(*c["origin"]),
+                            c["c"],
+                            font=font,
+                            fontsize=c["size"] or 10,
+                        )
+                    writer.write_text(page, color=(0, 0, 0))
+                    restored = gone
+                    after = _page_lines(page)
+            rep["restored_glyphs"] += len(restored)
+
+            for t in targets:
+                r = t["rect"]
+                left: list[str] = []
+                for line in after:
+                    for c in line["chars"]:
+                        if c["c"].isspace():
+                            continue
+                        b = c["bbox"]
+                        cx, cy = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+                        if (
+                            r.x0 <= cx <= r.x1
+                            and r.y0 <= cy <= r.y1
+                            and not still_there(c, [{"chars": restored}])
+                        ):
+                            left.append(c["c"])
+                entry = {
+                    "id": t["id"],
+                    "page": page_no,
+                    "text": t["text"],
+                    "rect": [round(v, 2) for v in (r.x0, r.y0, r.x1, r.y1)],
+                    "verified": not left,
+                }
+                if "in_field" in t:
+                    entry["in_field"] = t["in_field"]
+                rep["redacted"].append(entry)
+                if left:
+                    rep["unverified"].append(
+                        {"id": t["id"], "remaining": "".join(left)}
+                    )
+            if page_no not in rep["pages_touched"]:
+                rep["pages_touched"].append(page_no)
+        return doc.tobytes(garbage=3, deflate=True)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 # ---- filling -------------------------------------------------------------------
 
 _TRUE_WORDS = {"true", "yes", "y", "on", "x", "1", "checked", "check", "selected"}
@@ -1777,6 +2177,123 @@ class Tools:
         except Exception:
             return False
 
+    async def _store_copy(
+        self,
+        pdf_bytes: bytes,
+        out_name: str,
+        user_id: Optional[str],
+        source_file_id: str,
+        __request__=None,
+        __event_emitter__=None,
+    ) -> tuple[str, str, str, bool]:
+        """Save a new PDF through Open WebUI's file store and attach it to the chat.
+
+        Returns (file id, relative url, full url, indexed for search).
+        """
+        from open_webui.models.files import FileForm, Files
+        from open_webui.storage.provider import Storage
+
+        new_id = str(uuid.uuid4())
+        _, stored_path = Storage.upload_file(
+            io.BytesIO(pdf_bytes),
+            f"{new_id}_{out_name}",
+            {"OpenWebUI-User-Id": user_id or ""},
+        )
+        await Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=new_id,
+                filename=out_name,
+                path=stored_path,
+                data={},
+                meta={
+                    "name": out_name,
+                    "content_type": "application/pdf",
+                    "size": len(pdf_bytes),
+                    "source_file_id": source_file_id,
+                },
+            ),
+        )
+        url = f"/api/v1/files/{new_id}/content"
+        base = (self.valves.base_url or "").strip().rstrip("/")
+        if not base and __request__ is not None:
+            try:
+                base = (
+                    str(getattr(__request__.app.state.config, "WEBUI_URL", "") or "")
+                ).rstrip("/")
+            except Exception:
+                base = ""
+            if not base or base.startswith("http://localhost"):
+                try:
+                    base = str(__request__.base_url).rstrip("/")
+                except Exception:
+                    pass
+        full_url = f"{base}{url}" if base else url
+
+        # Index the copy like a normal upload so later questions in the chat
+        # can read it (otherwise retrieval logs a missing collection).
+        indexed = False
+        if __request__ is not None and user_id:
+            try:
+                from open_webui.internal.db import get_async_db_context
+                from open_webui.models.users import Users
+                from open_webui.routers.retrieval import (
+                    ProcessFileForm,
+                    process_file,
+                )
+
+                user_obj = await Users.get_user_by_id(user_id)
+                async with get_async_db_context() as db:
+                    await process_file(
+                        __request__,
+                        ProcessFileForm(file_id=new_id),
+                        user=user_obj,
+                        db=db,
+                    )
+                indexed = True
+            except Exception:
+                indexed = False
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {
+                        "files": [
+                            {
+                                "type": "file",
+                                "id": new_id,
+                                "name": out_name,
+                                "url": url,
+                                "content_type": "application/pdf",
+                                "size": len(pdf_bytes),
+                            }
+                        ]
+                    },
+                }
+            )
+        return new_id, url, full_url, indexed
+
+    def _review_images(self, pdf_bytes: bytes, pages: list) -> dict[str, str]:
+        """Page images for the model, up to review_pages, when the host passes them on."""
+        limit = max(0, min(int(self.valves.review_pages or 0), 4))
+        images: dict[str, str] = {}
+        if limit and self._host_shows_images_in_results():
+            for number in pages[:limit]:
+                try:
+                    data, mime, _ = render_pdf_page(
+                        pdf_bytes,
+                        page=number,
+                        dpi=self.valves.render_dpi,
+                        max_kb=self.valves.render_max_kb,
+                    )
+                    images[f"page_{number}"] = (
+                        f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+                    )
+                except Exception:
+                    continue
+        return images
+
     # ---- tools exposed to the model -------------------------------------
 
     async def list_form_fields(
@@ -1925,9 +2442,6 @@ class Tools:
         :param flatten: Leave unset. Only set true when the user explicitly asks for a flattened or non-editable PDF.
         :return: A summary: status, what was not written and why, the pages to check, and the full download URL of the filled PDF. When the user asks for a link, give them download_link_markdown verbatim.
         """
-        from open_webui.models.files import FileForm, Files
-        from open_webui.storage.provider import Storage
-
         try:
             user_id = (__user__ or {}).get("id")
             try:
@@ -2005,106 +2519,12 @@ class Tools:
             if not out_name.lower().endswith(".pdf"):
                 out_name += ".pdf"
 
-            new_id = str(uuid.uuid4())
-            _, stored_path = Storage.upload_file(
-                io.BytesIO(pdf_bytes),
-                f"{new_id}_{out_name}",
-                {"OpenWebUI-User-Id": user_id or ""},
+            new_id, _, full_url, indexed = await self._store_copy(
+                pdf_bytes, out_name, user_id, fid, __request__, __event_emitter__
             )
-            rec = await Files.insert_new_file(
-                user_id,
-                FileForm(
-                    id=new_id,
-                    filename=out_name,
-                    path=stored_path,
-                    data={},
-                    meta={
-                        "name": out_name,
-                        "content_type": "application/pdf",
-                        "size": len(pdf_bytes),
-                        "source_file_id": fid,
-                    },
-                ),
-            )
-            url = f"/api/v1/files/{new_id}/content"
-            base = (self.valves.base_url or "").strip().rstrip("/")
-            if not base and __request__ is not None:
-                try:
-                    base = (
-                        str(
-                            getattr(__request__.app.state.config, "WEBUI_URL", "") or ""
-                        )
-                    ).rstrip("/")
-                except Exception:
-                    base = ""
-                if not base or base.startswith("http://localhost"):
-                    try:
-                        base = str(__request__.base_url).rstrip("/")
-                    except Exception:
-                        pass
-            full_url = f"{base}{url}" if base else url
-
-            # Index the filled copy like a normal upload so later questions in
-            # the chat can read it (otherwise retrieval logs a missing collection).
-            indexed = False
-            if __request__ is not None and user_id:
-                try:
-                    from open_webui.internal.db import get_async_db_context
-                    from open_webui.models.users import Users
-                    from open_webui.routers.retrieval import (
-                        ProcessFileForm,
-                        process_file,
-                    )
-
-                    user_obj = await Users.get_user_by_id(user_id)
-                    async with get_async_db_context() as db:
-                        await process_file(
-                            __request__,
-                            ProcessFileForm(file_id=new_id),
-                            user=user_obj,
-                            db=db,
-                        )
-                    indexed = True
-                except Exception:
-                    indexed = False
-
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "files",
-                        "data": {
-                            "files": [
-                                {
-                                    "type": "file",
-                                    "id": new_id,
-                                    "name": out_name,
-                                    "url": url,
-                                    "content_type": "application/pdf",
-                                    "size": len(pdf_bytes),
-                                }
-                            ]
-                        },
-                    }
-                )
 
             pages = report.get("pages_touched") or []
-            limit = max(0, min(int(self.valves.review_pages or 0), 4))
-            images: dict[str, str] = {}
-            if limit and self._host_shows_images_in_results():
-                for number in pages[:limit]:
-                    try:
-                        data, mime, _ = render_pdf_page(
-                            pdf_bytes,
-                            page=number,
-                            dpi=self.valves.render_dpi,
-                            max_kb=self.valves.render_max_kb,
-                        )
-                        images[f"page_{number}"] = (
-                            f"data:{mime};base64,"
-                            + base64.b64encode(data).decode("ascii")
-                        )
-                    except Exception:
-                        continue
+            images = self._review_images(pdf_bytes, pages)
             unseen = [n for n in pages if f"page_{n}" not in images]
 
             steps = []
@@ -2224,3 +2644,174 @@ class Tools:
             __event_emitter__=__event_emitter__,
             __request__=__request__,
         )
+
+    async def find_text(
+        self,
+        text: str,
+        file_id: str = "",
+        whole_word: bool = True,
+        __user__: Optional[dict] = None,
+        __files__: Optional[list] = None,
+    ) -> str:
+        """
+        Find every place a piece of text is printed in an attached PDF and
+        give each a hit id, so redact_text can remove exactly that occurrence
+        and nothing else. Call this before redact_text; never redact by
+        guessing. Each hit has the page, the text as printed, its context on
+        the line, and in_field when the text sits in a form field. Pick the
+        hit ids whose context is the one the user means and pass them to
+        redact_text. Matching is on whole words: "2 day" is not found inside
+        "12 day". Set whole_word to false only when a whole-word search finds
+        nothing and the user clearly means part of a word. A scanned PDF has
+        no text layer and nothing to find; the result says so.
+        :param text: The exact text to find, as printed, e.g. "2 day" or "6/9/2026". Letter case matters; runs of spaces do not.
+        :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
+        :param whole_word: Leave true. False also matches inside words.
+        :return: JSON with the file, the query, count, and hits (id, page, text, rect, context, in_field).
+        """
+        try:
+            fid, path, name = await self._pick_file(
+                file_id, __files__, (__user__ or {}).get("id")
+            )
+            info = find_pdf_text(
+                path, text, whole_word=_as_bool(whole_word, default=True)
+            )
+            info.update({"file_id": fid, "file_name": name})
+            if info["count"] == 0 and "note" not in info:
+                info["note"] = (
+                    "Not found as a whole word. Check the spelling and letter case against the page; "
+                    "if the user means part of a word, call again with whole_word=false."
+                )
+            return json.dumps(info, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    async def redact_text(
+        self,
+        hits: str,
+        file_id: str = "",
+        output_name: str = "",
+        fill: str = "white",
+        __user__: Optional[dict] = None,
+        __files__: Optional[list] = None,
+        __event_emitter__=None,
+        __request__=None,
+    ):
+        """
+        Remove exactly the text behind the given hit ids from find_text and
+        return the redacted PDF as a chat attachment. The characters are
+        deleted from the file, not covered up. Pass only ids that find_text
+        returned for this same file; an id from another file or an edited
+        copy comes back in not_found or stale. The job is complete only when
+        status is "ok": every hit resolved and the text is confirmed gone.
+        When status is "partial", read not_found, stale and unverified, call
+        find_text on the returned file_id, and call redact_text again for
+        what remains. Before telling the user the text is gone, look at
+        page_images, or call render_page for pages that are not shown. To
+        redact more text afterwards, call find_text with the returned
+        file_id, not the original.
+        :param hits: JSON list of hit ids from find_text, e.g. ["p1:12:5-10", "p2:3:0-8"]. An entry may also be {"id": "...", "text": "..."} to require that the text at that place still reads that way.
+        :param file_id: Id of the attached PDF. Leave empty when only one PDF is attached.
+        :param output_name: File name for the redacted copy. Defaults to "<original>-redacted.pdf".
+        :param fill: "white" leaves the area blank (default); "black" draws a black box over it.
+        :return: A summary: status, what was not redacted and why, the pages to check, and the full download URL of the redacted PDF. When the user asks for a link, give them download_link_markdown verbatim.
+        """
+        try:
+            user_id = (__user__ or {}).get("id")
+            try:
+                parsed = json.loads(hits) if isinstance(hits, str) else hits
+            except json.JSONDecodeError as e:
+                return json.dumps({"error": f"hits is not valid JSON: {e}"})
+            if isinstance(parsed, (str, dict)):
+                parsed = [parsed]
+            if not isinstance(parsed, list) or not parsed:
+                return json.dumps(
+                    {
+                        "error": "hits must be a non-empty JSON list of hit ids from find_text"
+                    }
+                )
+            colour = {"white": (1, 1, 1), "black": (0, 0, 0)}.get(
+                str(fill or "white").strip().lower()
+            )
+            if colour is None:
+                return json.dumps({"error": 'fill must be "white" or "black"'})
+
+            fid, path, orig_name = await self._pick_file(file_id, __files__, user_id)
+            report: dict = {}
+            pdf_bytes = redact_pdf_text(path, parsed, fill=colour, report=report)
+
+            problems: dict[str, Any] = {}
+            for key in ("not_found", "stale", "unverified"):
+                if report.get(key):
+                    problems[key] = report[key]
+            if not report.get("redacted"):
+                # Nothing changed: an unchanged copy in the chat would pass for a redacted file.
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        **problems,
+                        "next": (
+                            "Nothing was redacted and no file was made. Call find_text on this file and "
+                            "pass the hit ids it returns, exactly. Do not ask the user."
+                        ),
+                    },
+                    indent=2,
+                )
+
+            base = os.path.splitext(os.path.basename(orig_name))[0]
+            out_name = output_name.strip() or f"{base}-redacted.pdf"
+            if not out_name.lower().endswith(".pdf"):
+                out_name += ".pdf"
+            new_id, _, full_url, indexed = await self._store_copy(
+                pdf_bytes, out_name, user_id, fid, __request__, __event_emitter__
+            )
+            pages = report.get("pages_touched") or []
+            images = self._review_images(pdf_bytes, pages)
+            unseen = [n for n in pages if f"page_{n}" not in images]
+
+            steps = []
+            if problems.get("not_found") or problems.get("stale"):
+                steps.append(
+                    "Some hits were NOT redacted (see not_found and stale). Call find_text with "
+                    f'file_id "{new_id}" and redact_text again with the new ids. Do not ask the user.'
+                )
+            if problems.get("unverified"):
+                steps.append(
+                    "The hits in unverified still show characters inside the redacted area. Look at the "
+                    "page image; if the text is still readable, tell the user it could not be removed."
+                )
+            if images:
+                steps.append(
+                    "Look at page_images and confirm the text is gone and nothing else was removed."
+                )
+            if unseen:
+                steps.append(
+                    f'Call render_page with file_id "{new_id}" for page(s) {", ".join(str(n) for n in unseen)} '
+                    "and check before telling the user the text is gone."
+                )
+
+            result: dict[str, Any] = {"status": "partial" if problems else "ok"}
+            result.update(problems)
+            result["next"] = " ".join(steps)
+            result.update(
+                {
+                    "file_id": new_id,
+                    "file_name": out_name,
+                    "download_url": full_url,
+                    "download_link_markdown": f"[{out_name}]({full_url})",
+                    "redacted": report["redacted"],
+                    "pages_touched": pages,
+                    "restored_glyphs": report.get("restored_glyphs", 0),
+                    "indexed_for_search": indexed,
+                }
+            )
+            if report.get("fields_cleared"):
+                result["fields_cleared"] = report["fields_cleared"]
+            if images:
+                # Returned as a dict: Open WebUI takes the pictures out for the
+                # model and turns the rest into JSON text.
+                result["page_images"] = images
+                return result
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)})

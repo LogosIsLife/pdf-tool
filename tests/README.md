@@ -50,8 +50,13 @@ boxes is split into one field per box; text is shrunk to fit its box but never
 below `min_font_size`, wrapped text stops at the bottom of the box, and a value
 that still does not fit is reported in `text_cut_off`; `flatten_form` flattens
 a filled copy without resending its values; and the listing tells the model
-that a printed line with no field cannot be filled. Storage, download links
-and search indexing on a real server are not covered.
+that a printed line with no field cannot be filled. For 1.5.0 it builds a
+small PDF of its own and checks that `find_text` matches whole words only
+(`2 day`, never `12 day`), that `redact_text` removes just that text and
+leaves the rest readable, that a value printed over a line of underscores
+goes while the underscores stay, and that stale or unknown hit ids are
+reported instead of acted on. Storage, download links and search indexing on
+a real server are not covered.
 
 ```
 uvx --with pymupdf --with pypdf --with pydantic --with pdfplumber --with numpy \
